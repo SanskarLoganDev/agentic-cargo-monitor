@@ -1,0 +1,9 @@
+fastapi
+uvicorn[standard]
+python-multipart
+python-dotenv
+sqlalchemy
+pypdf
+anthropic
+pydantic
+aiofiles
