@@ -14,7 +14,11 @@ Field sources:
             Covers: max_humidity_percent, max_shock_g, max_flight_delay_minutes,
             and their alert/spoilage messages.
 
-The 5 monitored parameters per shipment (UI → Service B → Service C):
+  [MANUAL] — Set directly in TRANSPORT_OVERRIDES in seed.py.
+            Covers: contact_email, contact_phone — used by future notification
+            services (Service E) to alert the responsible party on breach.
+
+The 5 monitored parameters per shipment (UI -> Service B -> Service C):
 
   1. temperature_celsius    slider    compared to temp_min/max_celsius      [PDF]
   2. humidity_percent       slider    compared to max_humidity_percent       [HARD]
@@ -38,6 +42,7 @@ UI dropdown behaviour with these thresholds:
 
 from __future__ import annotations
 
+import re
 from enum import Enum
 from typing import Optional
 
@@ -77,7 +82,7 @@ class FlightDelayStatus(str, Enum):
     DELAYED_6H = "delayed_6h"  # 360 min — triggers Pfizer + Moderna (240), not JYNNEOS
 
 
-# Lookup table — Service C converts dropdown string → integer minutes
+# Lookup table — Service C converts dropdown string -> integer minutes
 FLIGHT_DELAY_MINUTES: dict[str, int] = {
     FlightDelayStatus.ON_TIME:    0,
     FlightDelayStatus.DELAYED_2H: 120,
@@ -116,6 +121,28 @@ class ShipmentSchema(BaseModel):
         description=(
             "e.g. '195 vials, 0.3 mL each'. Null if not stated in the label — "
             "CDC storage summary PDFs typically do not include quantity information."
+        )
+    )
+
+    # ------------------------------------------------------------------
+    # Notification contacts  [MANUAL — set in seed.py TRANSPORT_OVERRIDES]
+    # Consumed by Service E to alert the responsible party on any breach.
+    # Not extracted from PDFs — set per shipment by the operator.
+    # ------------------------------------------------------------------
+    contact_email: Optional[str] = Field(
+        default=None,
+        description=(
+            "Email address of the responsible party for this shipment. "
+            "Used by Service E to send breach notifications. "
+            "e.g. 'cold-chain-ops@pharmalogistics.com'"
+        )
+    )
+    contact_phone: Optional[str] = Field(
+        default=None,
+        description=(
+            "Phone number of the responsible party for this shipment in E.164 format. "
+            "Used by Service E to send SMS/call notifications on breach. "
+            "e.g. '+12025551234'"
         )
     )
 
@@ -239,6 +266,32 @@ class ShipmentSchema(BaseModel):
     # ------------------------------------------------------------------
     # Validators
     # ------------------------------------------------------------------
+
+    @field_validator("contact_email")
+    @classmethod
+    def validate_email(cls, v: Optional[str]) -> Optional[str]:
+        if v is None:
+            return v
+        pattern = r"^[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}$"
+        if not re.match(pattern, v):
+            raise ValueError(
+                f"'{v}' is not a valid email address. "
+                "Expected format: name@domain.com"
+            )
+        return v
+
+    @field_validator("contact_phone")
+    @classmethod
+    def validate_phone(cls, v: Optional[str]) -> Optional[str]:
+        if v is None:
+            return v
+        # E.164 format: + followed by 7-15 digits
+        if not re.match(r"^\+[1-9]\d{6,14}$", v):
+            raise ValueError(
+                f"'{v}' is not a valid E.164 phone number. "
+                "Expected format: +12025551234 (+ followed by 7-15 digits, no spaces)"
+            )
+        return v
 
     @field_validator("temp_min_celsius", "temp_max_celsius")
     @classmethod

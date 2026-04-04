@@ -9,7 +9,7 @@ Pipeline per drug:
   2. Extract text with pypdf
   3. Claude extracts PDF-sourced fields (temperature, excursion, thaw window, etc.)
   4. Validate with Pydantic (ShipmentSchema)
-  5. Apply hardcoded transport parameters (humidity, shock, flight delay)
+  5. Apply hardcoded transport parameters (humidity, shock, flight delay, contacts)
   6. Write completed document to Firestore /shipments/{drug_id}
 
 Authentication:
@@ -89,6 +89,13 @@ SHIPMENTS = [
 
 # ---------------------------------------------------------------------------
 # Hardcoded transport parameters
+#
+# Drug labels never publish humidity limits, G-force ratings, delay tolerances,
+# or contact details. All of these are set here per shipment.
+#
+# contact_email / contact_phone — placeholder demo values.
+# Service E will read these from Firestore to send breach notifications.
+# Replace with real operator contacts before production use.
 # ---------------------------------------------------------------------------
 TRANSPORT_OVERRIDES: dict[str, dict] = {
 
@@ -110,6 +117,9 @@ TRANSPORT_OVERRIDES: dict[str, dict] = {
             "certainly exceeded the safe excursion limit. Verify cold chain logs "
             "immediately and prepare contingency cold storage at the receiving facility."
         ),
+        # Notification contacts — consumed by Service E for breach alerts
+        "contact_email": "rohinv@umd.edu",
+        "contact_phone": "+12408798960",
     },
 
     "moderna-001": {
@@ -128,9 +138,12 @@ TRANSPORT_OVERRIDES: dict[str, dict] = {
             "Moderna Spikevax stores at -50°C to -15°C. A 4-hour flight delay "
             "warrants cold chain assessment — ambient exposure risk is real at this "
             "duration. Once confirmed thawed, the vaccine is viable refrigerated at "
-            "2–8°C for up to 30 days. Verify whether dry ice or active refrigeration "
+            "2-8°C for up to 30 days. Verify whether dry ice or active refrigeration "
             "was maintained throughout the delay before accepting the shipment."
         ),
+        # Notification contacts — consumed by Service E for breach alerts
+        "contact_email": "dan0003@umd.edu",
+        "contact_phone": "+12404137654",
     },
 
     "jynneos-001": {
@@ -148,12 +161,15 @@ TRANSPORT_OVERRIDES: dict[str, dict] = {
         ),
         "max_flight_delay_minutes": 480,
         "flight_delay_spoilage_note": (
-            "JYNNEOS has an 8-week viability window after confirmed thaw at 2–8°C, "
+            "JYNNEOS has an 8-week viability window after confirmed thaw at 2-8°C, "
             "making it the most delay-tolerant of the three shipments. An 8-hour "
             "threshold reflects this resilience. Note: JYNNEOS is lyophilised — "
             "humidity exposure during the delay is the primary risk. Inspect packaging "
             "integrity even when the delay threshold has not been exceeded."
         ),
+        # Notification contacts — consumed by Service E for breach alerts
+        "contact_email": "sumi0309@umd.edu",
+        "contact_phone": "+12027601163",
     },
 }
 
@@ -318,10 +334,12 @@ def main() -> None:
             logger.info("  [PDF]  temp:     %.1f°C to %.1f°C | excursion: %d min",
                         schema.temp_min_celsius, schema.temp_max_celsius,
                         schema.max_excursion_duration_minutes)
-            logger.info("  [HARD] humidity: %.0f%% | shock: %.0fG | delay threshold: %d min",
+            logger.info("  [HARD] humidity: %.0f%% | shock: %.0fG | delay: %d min | "
+                        "contact: %s",
                         overrides["max_humidity_percent"],
                         overrides["max_shock_g"],
-                        overrides["max_flight_delay_minutes"])
+                        overrides["max_flight_delay_minutes"],
+                        overrides["contact_email"])
 
             results["success"].append(drug_id)
 
@@ -340,9 +358,9 @@ def main() -> None:
 
     logger.info("")
     logger.info("Firestore documents ready:")
-    logger.info("  /shipments/pfizer-001   temp: -90 to -60°C | delay threshold: 120 min (2h)")
-    logger.info("  /shipments/moderna-001  temp: -50 to -15°C | delay threshold: 240 min (4h)")
-    logger.info("  /shipments/jynneos-001  temp: -25 to -15°C | delay threshold: 480 min (8h)")
+    logger.info("  /shipments/pfizer-001   temp: -90 to -60°C | delay: 120 min (2h)")
+    logger.info("  /shipments/moderna-001  temp: -50 to -15°C | delay: 240 min (4h)")
+    logger.info("  /shipments/jynneos-001  temp: -25 to -15°C | delay: 480 min (8h)")
     logger.info("")
     logger.info("Flight delay dropdown behaviour:")
     logger.info("  on_time    (  0 min) → no drug triggers")
