@@ -18,6 +18,8 @@ provider "google" {
 # ─────────────────────────────────────────────
 resource "google_project_service" "apis" {
   for_each = toset([
+    "iam.googleapis.com",
+    "iamcredentials.googleapis.com",
     "storage.googleapis.com",
     "firestore.googleapis.com",
     "pubsub.googleapis.com",
@@ -52,6 +54,26 @@ resource "google_storage_bucket" "pdf_manifests" {
   }
 
   depends_on = [google_project_service.apis]
+}
+
+# ─────────────────────────────────────────────
+# Service Account — Service A seed script
+# ─────────────────────────────────────────────
+resource "google_service_account" "service_a_seed" {
+  account_id   = "service-a-seed"
+  display_name = "Service A — Bootstrap Seed Script"
+  description  = "Used by seed.py to write shipment documents to Firestore."
+  project      = var.project_id
+
+  depends_on = [google_project_service.apis]
+}
+
+resource "google_project_iam_member" "service_a_firestore" {
+  project = var.project_id
+  role    = "roles/datastore.user"
+  member  = "serviceAccount:${google_service_account.service_a_seed.email}"
+
+  depends_on = [google_service_account.service_a_seed]
 }
 
 # ─────────────────────────────────────────────

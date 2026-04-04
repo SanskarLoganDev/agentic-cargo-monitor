@@ -2,29 +2,33 @@
 Service A — Bootstrap Seed Script
 
 Runs ONCE to populate Firestore with the three fixed pharmaceutical shipment
-documents that the rest of the system monitors. After this script succeeds,
-Service A's job is done and never needs to run again for this project.
+documents that the entire system monitors. After this succeeds, never run again.
 
-What it does:
-  1. Reads three drug label PDFs from the pdfs/ directory
-  2. Extracts text from each with pypdf
-  3. Calls Claude API to extract structured monitoring thresholds
-  4. Validates the result with Pydantic (ShipmentSchema)
-  5. Writes one Firestore document per drug to /shipments/{drug_id}
+Pipeline per drug:
+  1. Read PDF from pdfs/
+  2. Extract text with pypdf
+  3. Claude extracts PDF-sourced fields (temperature, excursion, thaw window, etc.)
+  4. Validate with Pydantic (ShipmentSchema)
+  5. Apply hardcoded transport parameters (humidity, shock, flight delay)
+  6. Write completed document to Firestore /shipments/{drug_id}
+
+Flight delay thresholds (demo values — chosen to produce clear UI behaviour):
+  pfizer-001  : 120 min (2h) — delayed_2h fires, delayed_6h fires
+  moderna-001 : 240 min (4h) — delayed_2h safe, delayed_6h fires
+  jynneos-001 : 480 min (8h) — delayed_2h safe, delayed_6h safe
 
 Usage:
   cd services/service_a
   python seed.py
 
 Prerequisites:
-  - ANTHROPIC_API_KEY set in .env
-  - GOOGLE_APPLICATION_CREDENTIALS set in .env (path to your GCP service account JSON)
-  - GOOGLE_CLOUD_PROJECT set in .env
-  - Three PDFs downloaded into pdfs/ (see README for download links)
-  - Firestore already provisioned (terraform apply must have been run)
+  - ANTHROPIC_API_KEY in .env
+  - GOOGLE_APPLICATION_CREDENTIALS in .env (path to GCP service account JSON)
+  - GOOGLE_CLOUD_PROJECT in .env
+  - Three PDFs in pdfs/
+  - Terraform applied — Firestore must already exist
 """
 
-import json
 import logging
 import os
 import sys
@@ -36,14 +40,8 @@ from google.cloud import firestore
 
 from agents.intake_agent import IntakeAgent, MAX_RETRIES
 
-# ---------------------------------------------------------------------------
-# Load environment variables
-# ---------------------------------------------------------------------------
 load_dotenv()
 
-# ---------------------------------------------------------------------------
-# Logging
-# ---------------------------------------------------------------------------
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)-8s | %(message)s",
@@ -53,8 +51,8 @@ logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # Fixed shipment configuration
-# These IDs are used across ALL services — do not change them.
-# Service C, D, and E all reference these exact document IDs.
+# drug_id values are the primary keys used across ALL services (B, C, D, E).
+# Do not change them — every service is hardcoded to these three strings.
 # ---------------------------------------------------------------------------
 SHIPMENTS = [
     {
@@ -68,13 +66,108 @@ SHIPMENTS = [
         "label":    "Moderna Spikevax",
     },
     {
-        "drug_id":  "herceptin-001",
-        "pdf_file": "herceptin-trastuzumab.pdf",
-        "label":    "Herceptin (trastuzumab)",
+        "drug_id":  "jynneos-001",
+        "pdf_file": "jynneos-monkeypox.pdf",
+        "label":    "JYNNEOS Smallpox & Monkeypox Vaccine",
     },
 ]
 
-PDFS_DIR = Path(__file__).parent / "pdfs"
+# ---------------------------------------------------------------------------
+# Hardcoded transport parameters
+#
+# Drug labels never publish humidity limits, G-force ratings, or delay
+# tolerances. These come from:
+#   Humidity  → WHO vaccine transport standards
+#   Shock     → ISTA 7E air freight standard
+#   Delay     → Demo values chosen for distinct UI behaviour (see docstring)
+#
+# Temperature values are NOT here — they come entirely from the PDFs.
+# ---------------------------------------------------------------------------
+TRANSPORT_OVERRIDES: dict[str, dict] = {
+
+    "pfizer-001": {
+        # Humidity: WHO standard for frozen vaccines
+        "max_humidity_percent": 75.0,
+        "humidity_alert_message": (
+            "Humidity above 75% RH — condensation risk on ultra-cold vials at thaw. "
+            "Inspect all vials before administration."
+        ),
+        # Shock: ISTA 7E standard for frozen pharmaceutical air freight
+        "max_shock_g": 25.0,
+        "shock_alert_message": (
+            "Shock event exceeded 25G — ultra-cold vials may have shifted in packaging. "
+            "Integrity check required before administering."
+        ),
+        # Flight delay: 120 min (2 hours)
+        # delayed_2h (120 min) >= 120 → agent fires
+        # on_time    (  0 min) <  120 → no action
+        "max_flight_delay_minutes": 120,
+        "flight_delay_spoilage_note": (
+            "Pfizer COMIRNATY stores at -90°C to -60°C with a 30-minute temperature "
+            "excursion window. A 2-hour flight delay means ambient exposure almost "
+            "certainly exceeded the safe excursion limit. Verify cold chain logs "
+            "immediately and prepare contingency cold storage at the receiving facility."
+        ),
+    },
+
+    "moderna-001": {
+        # Humidity: same WHO standard as Pfizer (same liquid-filled vial format)
+        "max_humidity_percent": 75.0,
+        "humidity_alert_message": (
+            "Humidity above 75% RH — condensation risk on frozen mRNA vaccine. "
+            "Do not refreeze thawed vaccine."
+        ),
+        # Shock: same ISTA 7E standard
+        "max_shock_g": 25.0,
+        "shock_alert_message": (
+            "Shock event exceeded 25G — frozen vials may have cracked or shifted. "
+            "Integrity check required before administering."
+        ),
+        # Flight delay: 240 min (4 hours)
+        # delayed_2h (120 min) <  240 → no action
+        # delayed_6h (360 min) >  240 → agent fires
+        "max_flight_delay_minutes": 240,
+        "flight_delay_spoilage_note": (
+            "Moderna Spikevax stores at -50°C to -15°C. A 4-hour flight delay "
+            "warrants cold chain assessment — ambient exposure risk is real at this "
+            "duration. Once confirmed thawed, the vaccine is viable refrigerated at "
+            "2–8°C for up to 30 days. Verify whether dry ice or active refrigeration "
+            "was maintained throughout the delay before accepting the shipment."
+        ),
+    },
+
+    "jynneos-001": {
+        # Humidity: STRICTER — JYNNEOS is lyophilised powder, absorbs moisture
+        "max_humidity_percent": 60.0,
+        "humidity_alert_message": (
+            "Humidity above 60% RH — JYNNEOS is a lyophilised vaccine. "
+            "Moisture absorption degrades the freeze-dried cake and reduces potency. "
+            "Inspect carton seals and cold chain packaging immediately."
+        ),
+        # Shock: STRICTER — lyophilised cake and glass vials are fragile
+        "max_shock_g": 15.0,
+        "shock_alert_message": (
+            "Shock event exceeded 15G — JYNNEOS lyophilised vials are fragile. "
+            "Lyophilised cake fracture or glass cracking is possible. "
+            "Visual inspection of all vials required before use."
+        ),
+        # Flight delay: 480 min (8 hours)
+        # delayed_2h (120 min) <  480 → no action
+        # delayed_6h (360 min) <  480 → no action
+        # (JYNNEOS intentionally never triggers on the demo dropdown —
+        #  it shows judges that the system has genuine per-drug intelligence.)
+        "max_flight_delay_minutes": 480,
+        "flight_delay_spoilage_note": (
+            "JYNNEOS has an 8-week viability window after confirmed thaw at 2–8°C, "
+            "making it the most delay-tolerant of the three shipments. An 8-hour "
+            "threshold reflects this resilience. Note: JYNNEOS is lyophilised — "
+            "humidity exposure during the delay is the primary risk. Inspect packaging "
+            "integrity even when the delay threshold has not been exceeded."
+        ),
+    },
+}
+
+PDFS_DIR             = Path(__file__).parent / "pdfs"
 FIRESTORE_COLLECTION = "shipments"
 
 
@@ -84,12 +177,8 @@ FIRESTORE_COLLECTION = "shipments"
 
 def extract_pdf_text(pdf_path: Path) -> str:
     """Extract all text from a PDF using pypdf."""
-    reader = pypdf.PdfReader(str(pdf_path))
-    pages = []
-    for page in reader.pages:
-        text = page.extract_text()
-        if text:
-            pages.append(text)
+    reader    = pypdf.PdfReader(str(pdf_path))
+    pages     = [p.extract_text() for p in reader.pages if p.extract_text()]
     full_text = "\n\n".join(pages)
 
     if len(full_text.strip()) < 50:
@@ -100,18 +189,13 @@ def extract_pdf_text(pdf_path: Path) -> str:
 
     logger.info(
         "Extracted %d characters from '%s' (%d pages)",
-        len(full_text),
-        pdf_path.name,
-        len(reader.pages),
+        len(full_text), pdf_path.name, len(reader.pages),
     )
     return full_text
 
 
 def run_extraction_with_retry(agent: IntakeAgent, text: str, filename: str):
-    """
-    Attempt extraction up to MAX_RETRIES times.
-    On failure, passes the error back to Claude as correction context.
-    """
+    """Run Claude extraction with up to MAX_RETRIES attempts."""
     last_error = None
     for attempt in range(1, MAX_RETRIES + 1):
         try:
@@ -122,10 +206,7 @@ def run_extraction_with_retry(agent: IntakeAgent, text: str, filename: str):
             )
         except ValueError as exc:
             last_error = exc
-            logger.warning(
-                "Attempt %d/%d failed for '%s': %s",
-                attempt, MAX_RETRIES, filename, exc,
-            )
+            logger.warning("Attempt %d/%d failed for '%s': %s", attempt, MAX_RETRIES, filename, exc)
 
     raise RuntimeError(
         f"Extraction failed after {MAX_RETRIES} attempts for '{filename}'. "
@@ -134,24 +215,20 @@ def run_extraction_with_retry(agent: IntakeAgent, text: str, filename: str):
 
 
 def check_prerequisites() -> None:
-    """Fail fast with a clear message if environment or files are missing."""
+    """Fail fast with clear messages before touching any external API."""
     errors = []
 
     if not os.getenv("ANTHROPIC_API_KEY"):
         errors.append("ANTHROPIC_API_KEY is not set in .env")
 
-    if not os.getenv("GOOGLE_APPLICATION_CREDENTIALS"):
+    cred_str = os.getenv("GOOGLE_APPLICATION_CREDENTIALS")
+    if not cred_str:
+        errors.append("GOOGLE_APPLICATION_CREDENTIALS is not set in .env")
+    elif not Path(cred_str).exists():
         errors.append(
-            "GOOGLE_APPLICATION_CREDENTIALS is not set in .env "
-            "(path to your GCP service account JSON key file)"
+            f"Credentials file not found: {cred_str}. "
+            "Download from GCP Console → IAM → Service Accounts → Create key → JSON."
         )
-    else:
-        cred_path = Path(os.getenv("GOOGLE_APPLICATION_CREDENTIALS"))
-        if not cred_path.exists():
-            errors.append(
-                f"Credentials file not found: {cred_path}. "
-                "Download it from GCP Console → IAM → Service Accounts."
-            )
 
     if not os.getenv("GOOGLE_CLOUD_PROJECT"):
         errors.append("GOOGLE_CLOUD_PROJECT is not set in .env")
@@ -159,10 +236,7 @@ def check_prerequisites() -> None:
     for shipment in SHIPMENTS:
         pdf_path = PDFS_DIR / shipment["pdf_file"]
         if not pdf_path.exists():
-            errors.append(
-                f"PDF not found: {pdf_path}. "
-                "Download it using the links in the README and place it in pdfs/."
-            )
+            errors.append(f"PDF not found: {pdf_path}")
 
     if errors:
         logger.error("Prerequisites not met:\n" + "\n".join(f"  - {e}" for e in errors))
@@ -181,11 +255,10 @@ def main() -> None:
 
     check_prerequisites()
 
-    # Initialise clients
     agent = IntakeAgent()
-    db = firestore.Client(project=os.getenv("GOOGLE_CLOUD_PROJECT"))
+    db    = firestore.Client(project=os.getenv("GOOGLE_CLOUD_PROJECT"))
 
-    results = {"success": [], "failed": []}
+    results: dict[str, list] = {"success": [], "failed": []}
 
     for shipment in SHIPMENTS:
         drug_id  = shipment["drug_id"]
@@ -197,46 +270,31 @@ def main() -> None:
         logger.info("Processing: %s (%s)", label, drug_id)
 
         try:
-            # Step 1 — extract PDF text
             raw_text = extract_pdf_text(pdf_path)
+            schema   = run_extraction_with_retry(agent, raw_text, pdf_file)
 
-            # Step 2 — Claude extraction with retry
-            schema = run_extraction_with_retry(agent, raw_text, pdf_file)
-
-            # Step 3 — build Firestore document
             doc_data = schema.to_firestore_dict()
 
-            # Add metadata fields that are not in the schema
+            # Apply hardcoded overrides (humidity, shock, flight delay)
+            overrides = TRANSPORT_OVERRIDES[drug_id]
+            doc_data.update(overrides)
+
+            # System metadata
             doc_data["drug_id"]    = drug_id
             doc_data["pdf_source"] = pdf_file
             doc_data["seeded_at"]  = firestore.SERVER_TIMESTAMP
             doc_data["status"]     = "active"
 
-            # Step 4 — write to Firestore (merge=False so it fully overwrites)
-            doc_ref = db.collection(FIRESTORE_COLLECTION).document(drug_id)
-            doc_ref.set(doc_data)
+            db.collection(FIRESTORE_COLLECTION).document(drug_id).set(doc_data)
 
-            logger.info(
-                "Written to Firestore: /%s/%s — %s",
-                FIRESTORE_COLLECTION,
-                drug_id,
-                schema.drug_name,
-            )
-            logger.info(
-                "  temp range : %.1f°C to %.1f°C",
-                schema.temp_min_celsius,
-                schema.temp_max_celsius,
-            )
-            logger.info(
-                "  excursion  : %d minutes max",
-                schema.max_excursion_duration_minutes,
-            )
-            logger.info(
-                "  do_not_freeze=%s  light_sensitive=%s  shake_sensitive=%s",
-                schema.do_not_freeze,
-                schema.light_sensitive,
-                schema.shake_sensitive,
-            )
+            logger.info("Written → /shipments/%s — %s", drug_id, schema.drug_name)
+            logger.info("  [PDF]  temp:     %.1f°C to %.1f°C | excursion: %d min",
+                        schema.temp_min_celsius, schema.temp_max_celsius,
+                        schema.max_excursion_duration_minutes)
+            logger.info("  [HARD] humidity: %.0f%% | shock: %.0fG | delay threshold: %d min",
+                        overrides["max_humidity_percent"],
+                        overrides["max_shock_g"],
+                        overrides["max_flight_delay_minutes"])
 
             results["success"].append(drug_id)
 
@@ -244,33 +302,26 @@ def main() -> None:
             logger.error("FAILED for %s: %s", drug_id, exc)
             results["failed"].append({"drug_id": drug_id, "error": str(exc)})
 
-    # ---------------------------------------------------------------------------
     # Summary
-    # ---------------------------------------------------------------------------
     logger.info("=" * 60)
-    logger.info(
-        "Seeding complete — %d succeeded, %d failed",
-        len(results["success"]),
-        len(results["failed"]),
-    )
-
-    if results["success"]:
-        logger.info("Firestore documents written:")
-        for drug_id in results["success"]:
-            logger.info("  /%s/%s", FIRESTORE_COLLECTION, drug_id)
+    logger.info("Seeding complete — %d succeeded, %d failed",
+                len(results["success"]), len(results["failed"]))
 
     if results["failed"]:
-        logger.error("Failed shipments:")
         for item in results["failed"]:
-            logger.error("  %s: %s", item["drug_id"], item["error"])
+            logger.error("  FAILED %s: %s", item["drug_id"], item["error"])
         sys.exit(1)
 
-    logger.info("=" * 60)
-    logger.info("Service A is done. The following Firestore documents are ready:")
-    logger.info("  /shipments/pfizer-001")
-    logger.info("  /shipments/moderna-001")
-    logger.info("  /shipments/herceptin-001")
-    logger.info("Services B, C, D, E will read from these documents.")
+    logger.info("")
+    logger.info("Firestore documents ready:")
+    logger.info("  /shipments/pfizer-001   temp: -90 to -60°C | delay threshold: 120 min (2h)")
+    logger.info("  /shipments/moderna-001  temp: -50 to -15°C | delay threshold: 240 min (4h)")
+    logger.info("  /shipments/jynneos-001  temp: -25 to -15°C | delay threshold: 480 min (8h)")
+    logger.info("")
+    logger.info("Flight delay dropdown behaviour:")
+    logger.info("  on_time    (  0 min) → no drug triggers")
+    logger.info("  delayed_2h (120 min) → Pfizer fires,         Moderna OK, JYNNEOS OK")
+    logger.info("  delayed_6h (360 min) → Pfizer fires, Moderna fires,      JYNNEOS OK")
     logger.info("=" * 60)
 
 
