@@ -12,7 +12,20 @@ Pipeline per drug:
   5. Apply hardcoded transport parameters (humidity, shock, flight delay)
   6. Write completed document to Firestore /shipments/{drug_id}
 
-Flight delay thresholds (demo values — chosen to produce clear UI behaviour):
+Authentication:
+  Uses service account impersonation — no JSON key file required.
+  Your personal gcloud credentials (application default) impersonate
+  the service-a-seed SA. This is required because the org policy
+  iam.disableServiceAccountKeyCreation blocks JSON key creation.
+
+  Prerequisites:
+    1. gcloud auth application-default login
+    2. gcloud iam service-accounts add-iam-policy-binding \\
+         service-a-seed@PROJECT.iam.gserviceaccount.com \\
+         --member="user:YOU@gmail.com" \\
+         --role="roles/iam.serviceAccountTokenCreator"
+
+Flight delay thresholds (demo values):
   pfizer-001  : 120 min (2h) — delayed_2h fires, delayed_6h fires
   moderna-001 : 240 min (4h) — delayed_2h safe, delayed_6h fires
   jynneos-001 : 480 min (8h) — delayed_2h safe, delayed_6h safe
@@ -21,12 +34,11 @@ Usage:
   cd services/service_a
   python seed.py
 
-Prerequisites:
-  - ANTHROPIC_API_KEY in .env
-  - GOOGLE_APPLICATION_CREDENTIALS in .env (path to GCP service account JSON)
-  - GOOGLE_CLOUD_PROJECT in .env
-  - Three PDFs in pdfs/
-  - Terraform applied — Firestore must already exist
+Prerequisites (.env):
+  ANTHROPIC_API_KEY
+  SERVICE_ACCOUNT_EMAIL
+  GOOGLE_CLOUD_PROJECT
+  FIRESTORE_DATABASE
 """
 
 import logging
@@ -36,11 +48,14 @@ from pathlib import Path
 
 import pypdf
 from dotenv import load_dotenv
+from google.auth import impersonated_credentials, default as google_auth_default
 from google.cloud import firestore
 
 from agents.intake_agent import IntakeAgent, MAX_RETRIES
 
-load_dotenv()
+# Explicitly load .env from repo root regardless of where seed.py is run from
+_repo_root = Path(__file__).resolve().parent.parent.parent
+load_dotenv(dotenv_path=_repo_root / ".env")
 
 logging.basicConfig(
     level=logging.INFO,
@@ -74,33 +89,20 @@ SHIPMENTS = [
 
 # ---------------------------------------------------------------------------
 # Hardcoded transport parameters
-#
-# Drug labels never publish humidity limits, G-force ratings, or delay
-# tolerances. These come from:
-#   Humidity  → WHO vaccine transport standards
-#   Shock     → ISTA 7E air freight standard
-#   Delay     → Demo values chosen for distinct UI behaviour (see docstring)
-#
-# Temperature values are NOT here — they come entirely from the PDFs.
 # ---------------------------------------------------------------------------
 TRANSPORT_OVERRIDES: dict[str, dict] = {
 
     "pfizer-001": {
-        # Humidity: WHO standard for frozen vaccines
         "max_humidity_percent": 75.0,
         "humidity_alert_message": (
             "Humidity above 75% RH — condensation risk on ultra-cold vials at thaw. "
             "Inspect all vials before administration."
         ),
-        # Shock: ISTA 7E standard for frozen pharmaceutical air freight
         "max_shock_g": 25.0,
         "shock_alert_message": (
             "Shock event exceeded 25G — ultra-cold vials may have shifted in packaging. "
             "Integrity check required before administering."
         ),
-        # Flight delay: 120 min (2 hours)
-        # delayed_2h (120 min) >= 120 → agent fires
-        # on_time    (  0 min) <  120 → no action
         "max_flight_delay_minutes": 120,
         "flight_delay_spoilage_note": (
             "Pfizer COMIRNATY stores at -90°C to -60°C with a 30-minute temperature "
@@ -111,21 +113,16 @@ TRANSPORT_OVERRIDES: dict[str, dict] = {
     },
 
     "moderna-001": {
-        # Humidity: same WHO standard as Pfizer (same liquid-filled vial format)
         "max_humidity_percent": 75.0,
         "humidity_alert_message": (
             "Humidity above 75% RH — condensation risk on frozen mRNA vaccine. "
             "Do not refreeze thawed vaccine."
         ),
-        # Shock: same ISTA 7E standard
         "max_shock_g": 25.0,
         "shock_alert_message": (
             "Shock event exceeded 25G — frozen vials may have cracked or shifted. "
             "Integrity check required before administering."
         ),
-        # Flight delay: 240 min (4 hours)
-        # delayed_2h (120 min) <  240 → no action
-        # delayed_6h (360 min) >  240 → agent fires
         "max_flight_delay_minutes": 240,
         "flight_delay_spoilage_note": (
             "Moderna Spikevax stores at -50°C to -15°C. A 4-hour flight delay "
@@ -137,25 +134,18 @@ TRANSPORT_OVERRIDES: dict[str, dict] = {
     },
 
     "jynneos-001": {
-        # Humidity: STRICTER — JYNNEOS is lyophilised powder, absorbs moisture
         "max_humidity_percent": 60.0,
         "humidity_alert_message": (
             "Humidity above 60% RH — JYNNEOS is a lyophilised vaccine. "
             "Moisture absorption degrades the freeze-dried cake and reduces potency. "
             "Inspect carton seals and cold chain packaging immediately."
         ),
-        # Shock: STRICTER — lyophilised cake and glass vials are fragile
         "max_shock_g": 15.0,
         "shock_alert_message": (
             "Shock event exceeded 15G — JYNNEOS lyophilised vials are fragile. "
             "Lyophilised cake fracture or glass cracking is possible. "
             "Visual inspection of all vials required before use."
         ),
-        # Flight delay: 480 min (8 hours)
-        # delayed_2h (120 min) <  480 → no action
-        # delayed_6h (360 min) <  480 → no action
-        # (JYNNEOS intentionally never triggers on the demo dropdown —
-        #  it shows judges that the system has genuine per-drug intelligence.)
         "max_flight_delay_minutes": 480,
         "flight_delay_spoilage_note": (
             "JYNNEOS has an 8-week viability window after confirmed thaw at 2–8°C, "
@@ -170,10 +160,39 @@ TRANSPORT_OVERRIDES: dict[str, dict] = {
 PDFS_DIR             = Path(__file__).parent / "pdfs"
 FIRESTORE_COLLECTION = "shipments"
 
+# Firestore scopes required for impersonated credentials
+FIRESTORE_SCOPES = ["https://www.googleapis.com/auth/cloud-platform"]
+
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+def build_impersonated_credentials():
+    """
+    Build impersonated credentials using the local gcloud application default
+    credentials as the source, targeting the service-a-seed SA.
+
+    Requires:
+      - gcloud auth application-default login has been run
+      - The caller has roles/iam.serviceAccountTokenCreator on the target SA
+    """
+    sa_email = os.getenv("SERVICE_ACCOUNT_EMAIL")
+
+    # Load gcloud application default credentials as the source identity
+    source_credentials, _ = google_auth_default(scopes=FIRESTORE_SCOPES)
+
+    # Impersonate the service account
+    target_credentials = impersonated_credentials.Credentials(
+        source_credentials=source_credentials,
+        target_principal=sa_email,
+        target_scopes=FIRESTORE_SCOPES,
+        lifetime=3600,  # 1 hour — more than enough for seed.py
+    )
+
+    logger.info("Impersonating service account: %s", sa_email)
+    return target_credentials
+
 
 def extract_pdf_text(pdf_path: Path) -> str:
     """Extract all text from a PDF using pypdf."""
@@ -221,17 +240,14 @@ def check_prerequisites() -> None:
     if not os.getenv("ANTHROPIC_API_KEY"):
         errors.append("ANTHROPIC_API_KEY is not set in .env")
 
-    cred_str = os.getenv("GOOGLE_APPLICATION_CREDENTIALS")
-    if not cred_str:
-        errors.append("GOOGLE_APPLICATION_CREDENTIALS is not set in .env")
-    elif not Path(cred_str).exists():
-        errors.append(
-            f"Credentials file not found: {cred_str}. "
-            "Download from GCP Console → IAM → Service Accounts → Create key → JSON."
-        )
+    if not os.getenv("SERVICE_ACCOUNT_EMAIL"):
+        errors.append("SERVICE_ACCOUNT_EMAIL is not set in .env")
 
     if not os.getenv("GOOGLE_CLOUD_PROJECT"):
         errors.append("GOOGLE_CLOUD_PROJECT is not set in .env")
+
+    if not os.getenv("FIRESTORE_DATABASE"):
+        errors.append("FIRESTORE_DATABASE is not set in .env")
 
     for shipment in SHIPMENTS:
         pdf_path = PDFS_DIR / shipment["pdf_file"]
@@ -256,7 +272,20 @@ def main() -> None:
     check_prerequisites()
 
     agent = IntakeAgent()
-    db    = firestore.Client(project=os.getenv("GOOGLE_CLOUD_PROJECT"))
+
+    # Build impersonated credentials and connect to Firestore
+    credentials = build_impersonated_credentials()
+    db = firestore.Client(
+        project=os.getenv("GOOGLE_CLOUD_PROJECT"),
+        database=os.getenv("FIRESTORE_DATABASE"),
+        credentials=credentials,
+    )
+
+    logger.info(
+        "Connected to Firestore project=%s database=%s",
+        os.getenv("GOOGLE_CLOUD_PROJECT"),
+        os.getenv("FIRESTORE_DATABASE"),
+    )
 
     results: dict[str, list] = {"success": [], "failed": []}
 
@@ -275,11 +304,9 @@ def main() -> None:
 
             doc_data = schema.to_firestore_dict()
 
-            # Apply hardcoded overrides (humidity, shock, flight delay)
             overrides = TRANSPORT_OVERRIDES[drug_id]
             doc_data.update(overrides)
 
-            # System metadata
             doc_data["drug_id"]    = drug_id
             doc_data["pdf_source"] = pdf_file
             doc_data["seeded_at"]  = firestore.SERVER_TIMESTAMP
@@ -302,7 +329,6 @@ def main() -> None:
             logger.error("FAILED for %s: %s", drug_id, exc)
             results["failed"].append({"drug_id": drug_id, "error": str(exc)})
 
-    # Summary
     logger.info("=" * 60)
     logger.info("Seeding complete — %d succeeded, %d failed",
                 len(results["success"]), len(results["failed"]))

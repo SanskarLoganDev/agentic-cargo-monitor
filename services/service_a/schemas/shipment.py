@@ -111,8 +111,12 @@ class ShipmentSchema(BaseModel):
         default_factory=list,
         description="Lot/batch numbers if present in the label"
     )
-    quantity_description: str = Field(
-        ..., description="e.g. '195 vials, 0.3 mL each' or 'Not specified'"
+    quantity_description: Optional[str] = Field(
+        default=None,
+        description=(
+            "e.g. '195 vials, 0.3 mL each'. Null if not stated in the label — "
+            "CDC storage summary PDFs typically do not include quantity information."
+        )
     )
 
     # ------------------------------------------------------------------
@@ -157,7 +161,7 @@ class ShipmentSchema(BaseModel):
     thaw_window_hours: Optional[int] = Field(
         default=None,
         description=(
-            "Hours the vaccine remains viable after confirmed thaw at 2–8°C. "
+            "Hours the vaccine remains viable after confirmed thaw at 2-8°C. "
             "From PDF. Pfizer=1680 (10 wk), Moderna=720 (30 d), JYNNEOS=1344 (8 wk). "
             "Context for Service D spoilage reasoning — NOT the alert threshold."
         )
@@ -247,14 +251,14 @@ class ShipmentSchema(BaseModel):
     @classmethod
     def validate_excursion(cls, v: int) -> int:
         if v < 1 or v > 10080:
-            raise ValueError("max_excursion_duration_minutes must be 1–10080 (7 days).")
+            raise ValueError("max_excursion_duration_minutes must be 1-10080 (7 days).")
         return v
 
     @field_validator("max_flight_delay_minutes")
     @classmethod
     def validate_flight_delay(cls, v: int) -> int:
         if v < 0 or v > 1440:
-            raise ValueError("max_flight_delay_minutes must be 0–1440 (24 hours).")
+            raise ValueError("max_flight_delay_minutes must be 0-1440 (24 hours).")
         return v
 
     class Config:

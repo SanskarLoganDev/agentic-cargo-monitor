@@ -20,3 +20,8 @@ output "pubsub_topics" {
 output "bigquery_dataset" {
   value = google_bigquery_dataset.compliance_trail.dataset_id
 }
+
+output "service_a_seed_email" {
+  value       = google_service_account.service_a_seed.email
+  description = "Service A seed SA email — confirm this in GCP Console before downloading the key"
+}

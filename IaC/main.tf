@@ -13,6 +13,10 @@ provider "google" {
   region  = var.region
 }
 
+data "google_project" "project" {
+  project_id = var.project_id
+}
+
 # ─────────────────────────────────────────────
 # 1. Enable Required APIs
 # ─────────────────────────────────────────────
@@ -81,7 +85,7 @@ resource "google_project_iam_member" "service_a_firestore" {
 # ─────────────────────────────────────────────
 resource "google_firestore_database" "main" {
   project     = var.project_id
-  name        = "(default)"
+  name        = "cargo-monitor"
   location_id = var.firestore_location
   type        = "FIRESTORE_NATIVE"
 
