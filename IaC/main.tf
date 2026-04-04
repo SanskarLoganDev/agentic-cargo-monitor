@@ -82,12 +82,20 @@ resource "google_project_iam_member" "service_a_firestore" {
 
 # ─────────────────────────────────────────────
 # 3. Firestore Database (Native mode)
+#
+# deletion_policy = "DELETE" ensures terraform destroy actually deletes
+# the database in GCP rather than just removing it from state (ABANDON).
+# Note: GCP soft-deletes Firestore databases for 24 hours after deletion,
+# so re-creating with the same name requires waiting 24 hours or using
+# a different name.
 # ─────────────────────────────────────────────
 resource "google_firestore_database" "main" {
-  project     = var.project_id
-  name        = "cargo-monitor"
-  location_id = var.firestore_location
-  type        = "FIRESTORE_NATIVE"
+  project         = var.project_id
+  name            = "cargo-monitor"
+  location_id     = var.firestore_location
+  type            = "FIRESTORE_NATIVE"
+  deletion_policy = "DELETE"
+  delete_protection_state = "DELETE_PROTECTION_DISABLED"
 
   depends_on = [google_project_service.apis]
 }
@@ -132,7 +140,6 @@ resource "google_pubsub_subscription" "telemetry_stream_sub" {
   ack_deadline_seconds       = 60
   message_retention_duration = "600s"
 
-  # Push config: fill in the Cloud Function URL after deployment
   push_config {
     push_endpoint = "https://${var.region}-${var.project_id}.cloudfunctions.net/monitoring-agent"
     attributes    = { x-goog-version = "v1" }
@@ -199,23 +206,23 @@ resource "google_pubsub_subscription" "execute_actions_sub" {
 # 6. BigQuery Dataset – Compliance Trail
 # ─────────────────────────────────────────────
 resource "google_bigquery_dataset" "compliance_trail" {
-  dataset_id                  = "compliance_trail"
-  location                    = var.region
-  delete_contents_on_destroy  = true
+  dataset_id                 = "compliance_trail"
+  location                   = var.region
+  delete_contents_on_destroy = true
 
   depends_on = [google_project_service.apis]
 }
 
 resource "google_bigquery_table" "audit_log" {
-  dataset_id = google_bigquery_dataset.compliance_trail.dataset_id
-  table_id   = "audit_log"
+  dataset_id          = google_bigquery_dataset.compliance_trail.dataset_id
+  table_id            = "audit_log"
   deletion_protection = false
 
   schema = jsonencode([
-    { name = "shipment_id",  type = "STRING",    mode = "REQUIRED" },
-    { name = "event_type",   type = "STRING",    mode = "REQUIRED" },
-    { name = "actor",        type = "STRING",    mode = "NULLABLE" },
-    { name = "details",      type = "JSON",      mode = "NULLABLE" },
-    { name = "timestamp",    type = "TIMESTAMP", mode = "REQUIRED" },
+    { name = "shipment_id", type = "STRING",    mode = "REQUIRED" },
+    { name = "event_type",  type = "STRING",    mode = "REQUIRED" },
+    { name = "actor",       type = "STRING",    mode = "NULLABLE" },
+    { name = "details",     type = "JSON",      mode = "NULLABLE" },
+    { name = "timestamp",   type = "TIMESTAMP", mode = "REQUIRED" },
   ])
 }
