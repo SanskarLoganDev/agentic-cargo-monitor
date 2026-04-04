@@ -1,0 +1,9 @@
+# Place your three drug label PDFs here before running seed.py
+# Files are gitignored — download them manually (see README)
+#
+# Required files:
+#   pfizer-comirnaty.pdf    — CDC storage summary (1 page)
+#   moderna-spikevax.pdf    — CDC storage summary (1 page)
+#   herceptin-trastuzumab.pdf — Genentech prescribing info (3-4 pages)
+#
+# Download links are in the README.

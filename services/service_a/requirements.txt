@@ -1,0 +1,19 @@
+# Service A — Bootstrap Seed Script
+# Run once to populate Firestore with drug threshold documents.
+#
+# Install: pip install -r requirements.txt
+
+# PDF text extraction
+pypdf==5.1.0
+
+# Anthropic Claude API
+anthropic==0.39.0
+
+# Pydantic for schema validation
+pydantic==2.10.1
+
+# Google Cloud Firestore
+google-cloud-firestore==2.19.0
+
+# Environment variable loading
+python-dotenv==1.0.1
