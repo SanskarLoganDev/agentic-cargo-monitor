@@ -18,3 +18,10 @@ override.tf
 override.tf.json
 *_override.tf
 *_override.tf.json
+
+# Terraform plan output
+tfplan
+*.tfplan
+
+# VS Code
+.vscode/

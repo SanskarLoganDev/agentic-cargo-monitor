@@ -31,6 +31,7 @@ resource "google_project_service" "apis" {
     "run.googleapis.com",
     "eventarc.googleapis.com",
     "bigquery.googleapis.com",
+    "artifactregistry.googleapis.com",
   ])
   service            = each.key
   disable_on_destroy = false
@@ -61,6 +62,18 @@ resource "google_storage_bucket" "pdf_manifests" {
 }
 
 # ─────────────────────────────────────────────
+# 3. Artifact Registry — Docker repository
+# ─────────────────────────────────────────────
+resource "google_artifact_registry_repository" "agenticterps" {
+  repository_id = "agenticterps"
+  format        = "DOCKER"
+  location      = var.region
+  description   = "AgenticTerps Docker images"
+
+  depends_on = [google_project_service.apis]
+}
+
+# ─────────────────────────────────────────────
 # Service Account — Service A seed script
 # ─────────────────────────────────────────────
 resource "google_service_account" "service_a_seed" {
@@ -81,7 +94,48 @@ resource "google_project_iam_member" "service_a_firestore" {
 }
 
 # ─────────────────────────────────────────────
-# 3. Firestore Database (Native mode)
+# Service Account — Service C (Monitoring & Anomaly Agent)
+# ─────────────────────────────────────────────
+resource "google_service_account" "service_c" {
+  account_id   = "service-c-monitoring"
+  display_name = "Service C — Monitoring & Anomaly Agent"
+  project      = var.project_id
+  depends_on   = [google_project_service.apis]
+}
+
+# Read shipment documents from Firestore
+resource "google_project_iam_member" "service_c_firestore" {
+  project = var.project_id
+  role    = "roles/datastore.user"
+  member  = "serviceAccount:${google_service_account.service_c.email}"
+}
+
+# Publish messages to risk-detected topic
+resource "google_pubsub_topic_iam_member" "service_c_risk_publisher" {
+  project = var.project_id
+  topic   = google_pubsub_topic.risk_detected.name
+  role    = "roles/pubsub.publisher"
+  member  = "serviceAccount:${google_service_account.service_c.email}"
+}
+
+# Allow Cloud Run to be invoked (for Pub/Sub push auth)
+resource "google_project_iam_member" "service_c_pubsub_invoker" {
+  project = var.project_id
+  role    = "roles/run.invoker"
+  member  = "serviceAccount:${google_service_account.service_c.email}"
+}
+
+# Allow Service C SA to pull images from Artifact Registry
+resource "google_artifact_registry_repository_iam_member" "service_c_ar_reader" {
+  repository = google_artifact_registry_repository.agenticterps.name
+  location   = var.region
+  role       = "roles/artifactregistry.reader"
+  member     = "serviceAccount:${google_service_account.service_c.email}"
+}
+
+# ─────────────────────────────────────────────
+# 4. Firestore Database (Native mode)
+# ─────────────────────────────────────────────
 #
 # deletion_policy = "DELETE" ensures terraform destroy actually deletes
 # the database in GCP rather than just removing it from state (ABANDON).
@@ -90,18 +144,18 @@ resource "google_project_iam_member" "service_a_firestore" {
 # a different name.
 # ─────────────────────────────────────────────
 resource "google_firestore_database" "main" {
-  project         = var.project_id
-  name            = "cargo-monitor"
-  location_id     = var.firestore_location
-  type            = "FIRESTORE_NATIVE"
-  deletion_policy = "DELETE"
-  delete_protection_state = "DELETE_PROTECTION_DISABLED"
+  project                     = var.project_id
+  name                        = "cargo-monitor"
+  location_id                 = var.firestore_location
+  type                        = "FIRESTORE_NATIVE"
+  deletion_policy             = "DELETE"
+  delete_protection_state     = "DELETE_PROTECTION_DISABLED"
 
   depends_on = [google_project_service.apis]
 }
 
 # ─────────────────────────────────────────────
-# 4. Pub/Sub Topics
+# 5. Pub/Sub Topics
 # ─────────────────────────────────────────────
 
 # Service B → Service C: live sensor data
@@ -129,8 +183,8 @@ resource "google_pubsub_topic" "dead_letter" {
 }
 
 # ─────────────────────────────────────────────
-# 5. Pub/Sub Subscriptions (Push stubs)
-#    URL placeholders – update after deploying Cloud Functions
+# 6. Pub/Sub Subscriptions
+# Update push_endpoint values after each Cloud Run deploy
 # ─────────────────────────────────────────────
 
 resource "google_pubsub_subscription" "telemetry_stream_sub" {
@@ -141,7 +195,7 @@ resource "google_pubsub_subscription" "telemetry_stream_sub" {
   message_retention_duration = "600s"
 
   push_config {
-    push_endpoint = "https://${var.region}-${var.project_id}.cloudfunctions.net/monitoring-agent"
+    push_endpoint = var.service_c_url != "" ? "${var.service_c_url}/pubsub/telemetry" : "https://placeholder.invalid/pubsub/telemetry"
     attributes    = { x-goog-version = "v1" }
   }
 
@@ -164,7 +218,7 @@ resource "google_pubsub_subscription" "risk_detected_sub" {
   message_retention_duration = "600s"
 
   push_config {
-    push_endpoint = "https://${var.region}-${var.project_id}.cloudfunctions.net/orchestrator-agent"
+    push_endpoint = var.service_d_url != "" ? "${var.service_d_url}/pubsub/risk" : "https://placeholder.invalid/pubsub/risk"
     attributes    = { x-goog-version = "v1" }
   }
 
@@ -187,7 +241,7 @@ resource "google_pubsub_subscription" "execute_actions_sub" {
   message_retention_duration = "600s"
 
   push_config {
-    push_endpoint = "https://${var.region}-${var.project_id}.cloudfunctions.net/execution-agent"
+    push_endpoint = var.service_e_url != "" ? "${var.service_e_url}/pubsub/execute" : "https://placeholder.invalid/pubsub/execute"
     attributes    = { x-goog-version = "v1" }
   }
 
@@ -203,7 +257,7 @@ resource "google_pubsub_subscription" "execute_actions_sub" {
 }
 
 # ─────────────────────────────────────────────
-# 6. BigQuery Dataset – Compliance Trail
+# 7. BigQuery Dataset – Compliance Trail
 # ─────────────────────────────────────────────
 resource "google_bigquery_dataset" "compliance_trail" {
   dataset_id                 = "compliance_trail"
@@ -225,4 +279,20 @@ resource "google_bigquery_table" "audit_log" {
     { name = "details",     type = "JSON",      mode = "NULLABLE" },
     { name = "timestamp",   type = "TIMESTAMP", mode = "REQUIRED" },
   ])
+}
+
+# ─────────────────────────────────────────────
+# Outputs
+# ─────────────────────────────────────────────
+output "service_c_sa_email" {
+  value = google_service_account.service_c.email
+}
+
+output "artifact_registry_url" {
+  value       = "${var.region}-docker.pkg.dev/${var.project_id}/${google_artifact_registry_repository.agenticterps.repository_id}"
+  description = "Base URL for all Docker image pushes"
+}
+
+output "pdf_bucket_name" {
+  value = google_storage_bucket.pdf_manifests.name
 }
