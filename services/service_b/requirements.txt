@@ -1,0 +1,10 @@
+# Cloud Function HTTP trigger framework
+functions-framework==3.8.2
+
+# Google Cloud clients — ADC resolves credentials automatically from the
+# attached service account when running on Cloud Functions
+google-cloud-pubsub==2.26.1
+google-cloud-firestore==2.19.0
+
+# Schema validation
+pydantic==2.10.4
