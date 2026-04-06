@@ -94,6 +94,43 @@ resource "google_project_iam_member" "service_a_firestore" {
 }
 
 # ─────────────────────────────────────────────
+# Service Account — Service B (Telemetry Ingestion API)
+# Cloud Function — receives UI simulator telemetry, writes live state
+# to Firestore, and publishes to the telemetry-stream Pub/Sub topic.
+# No Cloud Run invoker or Artifact Registry access needed (Cloud Function,
+# not Cloud Run).
+# ─────────────────────────────────────────────
+resource "google_service_account" "service_b" {
+  account_id   = "service-b-telemetry"
+  display_name = "Service B — Telemetry Ingestion API"
+  description  = "Used by the telemetry Cloud Function to write live telemetry state to Firestore and publish to telemetry-stream."
+  project      = var.project_id
+
+  depends_on = [google_project_service.apis]
+}
+
+# Read/write shipment documents in Firestore
+# Required for: shipment existence check + live_telemetry map write
+resource "google_project_iam_member" "service_b_firestore" {
+  project = var.project_id
+  role    = "roles/datastore.user"
+  member  = "serviceAccount:${google_service_account.service_b.email}"
+
+  depends_on = [google_service_account.service_b]
+}
+
+# Publish telemetry readings to the telemetry-stream topic
+# Service C subscribes to this topic to run anomaly detection
+resource "google_pubsub_topic_iam_member" "service_b_telemetry_publisher" {
+  project = var.project_id
+  topic   = google_pubsub_topic.telemetry_stream.name
+  role    = "roles/pubsub.publisher"
+  member  = "serviceAccount:${google_service_account.service_b.email}"
+
+  depends_on = [google_service_account.service_b, google_pubsub_topic.telemetry_stream]
+}
+
+# ─────────────────────────────────────────────
 # Service Account — Service C (Monitoring & Anomaly Agent)
 # ─────────────────────────────────────────────
 resource "google_service_account" "service_c" {

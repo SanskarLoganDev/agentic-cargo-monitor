@@ -1,0 +1,19 @@
+output "service_b_sa_email" {
+  value       = google_service_account.service_b.email
+  description = "Service account email for the Service B Cloud Function — use with --service-account at deploy time"
+}
+
+output "service_c_sa_email" {
+  value       = google_service_account.service_c.email
+  description = "Service account email for the Service C Cloud Run service"
+}
+
+output "artifact_registry_url" {
+  value       = "${var.region}-docker.pkg.dev/${var.project_id}/${google_artifact_registry_repository.agenticterps.repository_id}"
+  description = "Base URL for all Docker image pushes"
+}
+
+output "pdf_bucket_name" {
+  value       = google_storage_bucket.pdf_manifests.name
+  description = "GCS bucket name for PDF manifest uploads"
+}
