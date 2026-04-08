@@ -1,244 +1,157 @@
 # Agentic Cargo Monitor
 
-An agentic AI system for real-time pharmaceutical cold-chain monitoring.  
-The system uses Claude AI to autonomously detect anomalies in shipment telemetry, reason about risks, and coordinate cascading responses — while keeping a human in the loop for high-stakes decisions.
+An agentic AI system for real-time pharmaceutical cold-chain monitoring.
+Uses Claude AI to autonomously detect shipment anomalies, reason about risk,
+and coordinate cascading responses — with a human in the loop for high-stakes decisions.
 
 ---
 
-## Project Overview
-
-A pharmaceutical distributor ships temperature-sensitive drugs (vaccines, biologics, insulin) using OnAsset SENTRY-equipped containers. This system:
-
-1. **Reads drug labels** (PDFs) to extract monitoring thresholds — handled by **Service A**
-2. **Simulates live telemetry** (temperature, humidity, shock) via a web UI dashboard
-3. **Monitors for threshold breaches** using a rule engine
-4. **Reasons about risks** using a Claude AI agentic loop with tool use
-5. **Executes cascading actions** (reroute, notify hospital, escalate customs, log compliance) with human approval gates
-
----
-
-## Repository Structure
+## Architecture Overview
 
 ```
-agentic-cargo-monitor/          ← repo root — venv and .env live here
-├── .env                        ← your secrets (gitignored — never commit)
-├── .env.example                ← template — copy this to .env
-├── requirements.txt            ← all dependencies for all services
-├── README.md
-└── services/
-    ├── service_a/              ← PDF intake + Claude extraction  (built)
-    │   ├── main.py
-    │   ├── events.py
-    │   ├── agents/
-    │   │   └── intake_agent.py
-    │   ├── routers/
-    │   │   └── upload.py
-    │   ├── schemas/
-    │   │   └── shipment.py
-    │   ├── db/
-    │   │   ├── database.py
-    │   │   └── models.py
-    │   └── uploads/
-    ├── service_b/              ← Telemetry ingestion API         (coming)
-    ├── service_c/              ← Monitoring & anomaly detection  (coming)
-    ├── service_d/              ← Orchestrator agent              (coming)
-    └── service_e/              ← Execution agent + HITL          (coming)
+services/
+├── service_a/   ← Bootstrap seed script — runs once        (built)
+├── service_b/   ← Telemetry ingestion Cloud Function       (coming)
+├── service_c/   ← Monitoring agent Cloud Function          (coming)
+├── service_d/   ← Orchestrator agent Cloud Function        (coming)
+└── service_e/   ← Execution agent Cloud Function           (coming)
+
+IaC/             ← Terraform — provisions GCP infrastructure
 ```
+
+**Platform:** Google Cloud Platform (GCP)
+**Services B–E:** Cloud Functions triggered by Pub/Sub push subscriptions
+**Database:** Firestore (real-time listeners feed the dashboard directly)
+**AI model:** Claude claude-sonnet-4-6 via Anthropic API (direct SDK — no LangChain)
+
+### The three monitored shipments (fixed)
+
+| Drug ID | Drug | Category | Temp range |
+|---|---|---|---|
+| `pfizer-001` | Pfizer COMIRNATY (BNT162b2) | mRNA vaccine | −90°C to −60°C |
+| `moderna-001` | Moderna Spikevax (mRNA-1273) | mRNA vaccine | −50°C to −15°C |
+| `herceptin-001` | Herceptin (trastuzumab) | Oncology biologic | +2°C to +8°C |
 
 ---
 
-## Service A — Intake Agent
+## Service A — Bootstrap Seed Script
 
-**Responsibility:** Accept a pharmaceutical drug label PDF, use Claude AI to extract structured shipment monitoring parameters, and store them in SQLite. Publishes a `shipment.created` event so downstream services know what thresholds to enforce.
+Service A is **not** a web service. It is a one-time script that:
 
-### What it extracts from a PDF
+1. Reads three pharmaceutical drug label PDFs from `pdfs/`
+2. Extracts text from each using `pypdf`
+3. Calls Claude API to extract structured monitoring thresholds
+4. Validates the result with Pydantic
+5. Writes one Firestore document per drug to `/shipments/{drug_id}`
 
-| Field | Example |
+Run it once before any other service. After it succeeds, the Firestore
+documents are the ground truth for the entire system.
+
+### Folder structure
+
+```
+services/service_a/
+├── seed.py              ← entry point — run this
+├── requirements.txt
+├── agents/
+│   └── intake_agent.py  ← Claude extraction logic
+├── schemas/
+│   └── shipment.py      ← Pydantic validation model
+└── pdfs/                ← place your PDFs here (gitignored)
+    ├── pfizer-comirnaty.pdf
+    ├── moderna-spikevax.pdf
+    └── herceptin-trastuzumab.pdf
+```
+
+### Prerequisites
+
+| Requirement | Details |
 |---|---|
-| `drug_name` | COMIRNATY (BNT162b2) |
-| `temp_min_celsius` | -90.0 |
-| `temp_max_celsius` | -60.0 |
-| `max_excursion_duration_minutes` | 30 |
-| `do_not_freeze` | false |
-| `light_sensitive` | true |
-| `shake_sensitive` | false |
-| `iata_handling_codes` | ["PIL", "ACT", "EMD"] |
-| `regulatory_framework` | EU GDP 2013/C 343/01 |
+| Python 3.11+ | `python --version` |
+| GCP project | Must exist and have billing enabled |
+| Terraform applied | Firestore must be provisioned — see IaC/ |
+| Anthropic API key | From [console.anthropic.com](https://console.anthropic.com) |
+| GCP service account key | See setup steps below |
 
----
+### Step-by-step setup
 
-## Prerequisites
+**Step 1 — Apply Terraform (if not done yet)**
 
-| Tool | Version | Notes |
-|---|---|---|
-| Python | 3.11+ | `python --version` to check |
-| pip | latest | `pip install --upgrade pip` |
-| Anthropic API key | — | Get from [console.anthropic.com](https://console.anthropic.com) |
-
----
-
-## Setup (one-time)
-
-All commands run from the **repo root** (`agentic-cargo-monitor/`).
-
-### Step 1 — Clone the repo
+Your teammate handles this. Firestore must exist before `seed.py` runs.
 
 ```bash
-git clone <your-repo-url>
-cd agentic-cargo-monitor
+cd IaC
+# Fill in your project_id in terraform.tfvars first
+terraform init
+terraform apply
 ```
 
-### Step 2 — Create a virtual environment at the repo root
+**Step 2 — Create a GCP Service Account**
 
-**Windows:**
-```powershell
-python -m venv .venv
-.venv\Scripts\activate
+In GCP Console:
+```
+IAM & Admin → Service Accounts → Create Service Account
+  Name: service-a-seed
+  Role: Cloud Datastore User
+  → Create key → JSON → download
 ```
 
-**macOS / Linux:**
-```bash
-python -m venv .venv
-source .venv/bin/activate
-```
+Save the downloaded file as `gcp-credentials.json` in the repo root.
+It is gitignored — never commit it.
 
-### Step 3 — Install dependencies
-
-```powershell
-pip install -r requirements.txt
-```
-
-### Step 4 — Set up your environment variables
-
-```powershell
-# Windows
-copy .env.example .env
-
-# macOS / Linux
-cp .env.example .env
-```
-
-Open `.env` and add your Anthropic API key:
+**Step 3 — Fill in `.env`**
 
 ```env
 ANTHROPIC_API_KEY=sk-ant-...
+GOOGLE_APPLICATION_CREDENTIALS=./gcp-credentials.json
+GOOGLE_CLOUD_PROJECT=your-gcp-project-id
 ```
 
-> `.env` is gitignored. Never commit your API key to git.
+**Step 4 — Download the three PDFs into `services/service_a/pdfs/`**
 
----
+| File | Download |
+|---|---|
+| `pfizer-comirnaty.pdf` | [CDC Storage Summary](https://www.cdc.gov/vaccines/covid-19/info-by-product/pfizer/downloads/storage-summary.pdf) |
+| `moderna-spikevax.pdf` | [CDC Storage Summary](https://www.cdc.gov/vaccines/covid-19/info-by-product/moderna/downloads/storage-summary.pdf) |
+| `herceptin-trastuzumab.pdf` | [Genentech Prescribing Info](https://www.gene.com/download/pdf/herceptin_prescribing.pdf) |
 
-## Running Service A
+**Step 5 — Install dependencies**
 
-From the **repo root**, with your venv activated:
+```bash
+# From repo root, with .venv activated
+pip install -r services/service_a/requirements.txt
+```
 
-```powershell
-uvicorn main:app --reload --port 8001 --app-dir services/service_a
+**Step 6 — Run the seed script**
+
+```bash
+cd services/service_a
+python seed.py
 ```
 
 Expected output:
 ```
-INFO | Starting Service A — Intake Agent
-INFO | SQLite tables ready
-INFO | IntakeAgent ready
-INFO:     Uvicorn running on http://127.0.0.1:8001 (Press CTRL+C to quit)
+INFO | Service A — Seed Script
+INFO | Seeding 3 shipments into Firestore
+INFO | Processing: Pfizer COMIRNATY (pfizer-001)
+INFO | Calling Claude API for 'pfizer-comirnaty.pdf'
+INFO | Written to Firestore: /shipments/pfizer-001
+INFO |   temp range : -90.0°C to -60.0°C
+INFO |   excursion  : 30 minutes max
+INFO | Processing: Moderna Spikevax (moderna-001)
+INFO | Written to Firestore: /shipments/moderna-001
+INFO | Processing: Herceptin (herceptin-001)
+INFO | Written to Firestore: /shipments/herceptin-001
+INFO | Seeding complete — 3 succeeded, 0 failed
 ```
 
-Then open **http://127.0.0.1:8001/docs** to see the Swagger UI.
+**Step 7 — Verify in Firestore Console**
 
-> **Common mistake:** Running `uvicorn main:app` from the repo root *without* `--app-dir services/service_a`
-> will fail with `Could not import module "main"` because `main.py` is inside `services/service_a/`, not at the root.
+GCP Console → Firestore → Data
 
----
-
-## Testing the Upload
-
-### Option A — Swagger UI (easiest)
-
-1. Go to **http://127.0.0.1:8001/docs**
-2. Click `POST /upload/pdf` → **Try it out**
-3. Click **Choose File**, select a drug label PDF
-4. Click **Execute**
-5. The response body will contain the full extracted `ShipmentRecord` JSON
-
-### Option B — curl
-
-```bash
-curl -X POST http://127.0.0.1:8001/upload/pdf \
-  -F "file=@path/to/drug_label.pdf" \
-  -H "accept: application/json"
-```
-
-### Option C — Python requests
-
-```python
-import requests
-
-with open("pfizer_storage_summary.pdf", "rb") as f:
-    response = requests.post(
-        "http://127.0.0.1:8001/upload/pdf",
-        files={"file": ("pfizer_storage_summary.pdf", f, "application/pdf")},
-    )
-
-print(response.json())
-```
-
----
-
-## Recommended Test PDFs
-
-Download any of these and upload via `/upload/pdf`:
-
-| Drug | Category | PDF URL |
-|---|---|---|
-| **Pfizer COMIRNATY** (mRNA vaccine) | ultra_cold | [CDC Storage Summary](https://www.cdc.gov/vaccines/covid-19/info-by-product/pfizer/downloads/storage-summary.pdf) |
-| **Moderna Spikevax** (mRNA vaccine) | deep_frozen | [CDC Storage Summary](https://www.cdc.gov/vaccines/covid-19/info-by-product/moderna/downloads/storage-summary.pdf) |
-| **Keytruda** (pembrolizumab) | refrigerated | [Merck Prescribing Info](https://www.merck.com/product/usa/pi_circulars/k/keytruda/keytruda_pi.pdf) |
-| **Herceptin** (trastuzumab) | refrigerated | [Genentech PI](https://www.gene.com/download/pdf/herceptin_prescribing.pdf) |
-
-### Expected response
-
-```json
-{
-  "id": 1,
-  "shipment_id": "3f7a2e1b-...",
-  "drug_name": "COMIRNATY (BNT162b2)",
-  "manufacturer": "Pfizer-BioNTech",
-  "cargo_category": "vaccine",
-  "temp_classification": "ultra_cold",
-  "temp_min_celsius": -90.0,
-  "temp_max_celsius": -60.0,
-  "max_excursion_duration_minutes": 30,
-  "do_not_freeze": false,
-  "light_sensitive": true,
-  "iata_handling_codes": ["PIL", "ACT", "EMD"],
-  "regulatory_framework": "EU GDP 2013/C 343/01",
-  "extraction_model": "claude-sonnet-4-6",
-  "created_at": "2025-01-15T10:30:00",
-  "status": "active"
-}
-```
-
----
-
-## Cloud vs Local Equivalence
-
-| Cloud (original proposal) | Local (this implementation) |
-|---|---|
-| Google Cloud Storage (GCS) | `/uploads/` folder |
-| Eventarc trigger | `POST /upload/pdf` endpoint |
-| Firestore | SQLite via SQLAlchemy |
-| Pub/Sub topic | `asyncio.Queue` in `events.py` |
-| LangChain | Direct `anthropic` SDK |
-
----
-
-## For Teammates — Adding Services B, C, D, E
-
-1. Create `services/service_b/` with its own `main.py`
-2. Add any new dependencies to the root `requirements.txt`
-3. Run with: `uvicorn main:app --reload --port 8002 --app-dir services/service_b`
-4. To receive events from Service A: `from services.service_a.events import consume`
+You should see a `shipments` collection with three documents:
+`pfizer-001`, `moderna-001`, `herceptin-001` — each containing all
+the extracted threshold fields.
 
 ---
 
@@ -246,23 +159,53 @@ Download any of these and upload via `/upload/pdf`:
 
 | Error | Cause | Fix |
 |---|---|---|
-| `Could not import module "main"` | Running uvicorn from wrong directory | Add `--app-dir services/service_a` to the command |
-| `ANTHROPIC_API_KEY not set` | Missing or empty `.env` | Check `.env` exists at repo root and key is filled in |
-| `422 — scanned image PDF` | pypdf found no text | Use a digitally-created PDF, not a scanned document |
-| `422 — Only PDF files accepted` | Wrong file type | Upload a `.pdf` file |
-| `422 — AI extraction failed` | Claude could not parse the document | Ensure it's a drug label or prescribing info PDF |
-| Port 8001 already in use | Another process on that port | Use `--port 8002` or stop the other process |
+| `ANTHROPIC_API_KEY is not set` | Missing .env entry | Add key to .env |
+| `GOOGLE_APPLICATION_CREDENTIALS is not set` | Missing .env entry | Add path to .env |
+| `Credentials file not found` | Wrong path or file not downloaded | Download SA key and place at path in .env |
+| `GOOGLE_CLOUD_PROJECT is not set` | Missing .env entry | Add your GCP project ID |
+| `PDF not found` | PDFs not downloaded into pdfs/ | Download all three PDFs (see Step 4) |
+| `Too little text extracted` | Scanned image PDF | Use digitally-created PDF only |
+| `Extraction failed after 2 attempts` | Claude could not parse the document | Verify PDF is a drug label / prescribing info doc |
+| `403 PERMISSION_DENIED` on Firestore | SA missing Firestore permission | Add `Cloud Datastore User` role to service account |
+| `terraform apply` fails | Project ID not set | Fill in `project_id` in `IaC/terraform.tfvars` |
 
 ---
 
-## Tech Stack
+## For Teammates — Services B through E
 
-| Component | Technology |
-|---|---|
-| API framework | FastAPI |
-| AI model | Claude claude-sonnet-4-6 (Anthropic) |
-| PDF parsing | pypdf |
-| Data validation | Pydantic v2 |
-| Database | SQLite via SQLAlchemy (swappable to PostgreSQL) |
-| Event bus | asyncio.Queue (swappable to Redis) |
-| Server | Uvicorn |
+Each service will be a Cloud Function in GCP.
+
+**Firestore document IDs to use (hardcoded across all services):**
+- `pfizer-001`
+- `moderna-001`
+- `herceptin-001`
+
+**Firestore collections:**
+- `/shipments/{drug_id}` — thresholds (written by Service A)
+- `/monitoring_state/{drug_id}` — live excursion state (written by Service C)
+- `/telemetry_state/{drug_id}` — current slider values (written by Service B)
+- `/pending_approvals/{approval_id}` — HITL queue (written by Service D)
+- `/audit_log/{entry_id}` — compliance trail (written by Service E)
+
+**Pub/Sub topics (provisioned by Terraform):**
+- `telemetry-stream` — Service B publishes, Service C subscribes
+- `risk-detected` — Service C publishes, Service D subscribes
+- `execute-actions` — Firestore trigger publishes, Service E subscribes
+
+---
+
+## Terraform Changes Needed (IaC/)
+
+The current Terraform provisions infrastructure but is missing:
+
+1. **Service account + IAM bindings** — each Cloud Function needs a dedicated
+   service account with appropriate roles (Firestore read/write, Pub/Sub publish/subscribe).
+   Currently these must be created manually in the console.
+
+2. **Cloud Function deployments** — the Terraform does not yet deploy the function
+   code. Add `google_cloudfunctions2_function` resources for Services B–E once
+   their code is ready.
+
+3. **`project_id` in `terraform.tfvars`** — the placeholder value
+   `"project_id_goes_here"` must be replaced with the actual GCP project ID
+   before `terraform apply` will work.

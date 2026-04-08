@@ -228,3 +228,21 @@ test_*.db
 
 # Pytest cache
 .pytest_cache/
+
+# GCP service account key — NEVER commit this
+gcp-credentials.json
+*-credentials.json
+*-service-account.json
+
+# Drug label PDFs — download manually, do not commit
+services/service_a/pdfs/*.pdf
+services/service_a/pdfs/*.PDF
+
+# Old uploads folder (SQLite era)
+services/service_a/uploads/*.pdf
+services/service_a/uploads/*.PDF
+
+# SQLite databases (removed but kept as safety net)
+*.db
+*.sqlite
+*.sqlite3

@@ -1,9 +1,17 @@
-fastapi
-uvicorn[standard]
-python-multipart
-python-dotenv
-sqlalchemy
+# PDF text extraction
 pypdf
+
+# Anthropic Claude API
 anthropic
+
+# Pydantic for schema validation
 pydantic
-aiofiles
+
+# Google Cloud Firestore
+google-cloud-firestore
+
+# Google Auth — required for service account impersonation
+google-auth
+
+# Environment variable loading
+python-dotenv
