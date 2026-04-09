@@ -3,20 +3,20 @@ Pydantic schema for pharmaceutical shipment data stored in Firestore.
 
 Field sources:
 
-  [PDF]   — Claude extracts from the drug label PDF via intake_agent.py.
-            Covers: drug identity, temperature thresholds, excursion window,
-            do_not_freeze, light_sensitive, thaw_window_hours, stability notes,
-            IATA codes.
+  [PDF]    — Claude extracts from the drug label PDF via intake_agent.py.
+             Covers: drug identity, temperature thresholds, excursion window,
+             do_not_freeze, light_sensitive, thaw_window_hours, stability notes,
+             IATA codes.
 
-  [HARD]  — seed.py writes these after Claude extraction using industry
-            transport standards (WHO, ISTA 7E). Drug labels never publish
-            humidity limits, shock G-force ratings, or flight delay thresholds.
-            Covers: max_humidity_percent, max_shock_g, max_flight_delay_minutes,
-            and their alert/spoilage messages.
+  [HARD]   — seed.py writes these after Claude extraction using industry
+             transport standards (WHO, ISTA 7E). Drug labels never publish
+             humidity limits, shock G-force ratings, or flight delay thresholds.
+             Covers: max_humidity_percent, max_shock_g, max_flight_delay_minutes,
+             and their alert/spoilage messages.
 
   [MANUAL] — Set directly in TRANSPORT_OVERRIDES in seed.py.
-            Covers: contact_email, contact_phone — used by future notification
-            services (Service E) to alert the responsible party on breach.
+             Covers all contact, logistics, cargo, and timing fields —
+             none of these appear in drug label PDFs.
 
 The 5 monitored parameters per shipment (UI -> Service B -> Service C):
 
@@ -38,6 +38,15 @@ UI dropdown behaviour with these thresholds:
   on_time    (  0 min) — no drug triggers
   delayed_2h (120 min) — Pfizer fires  (120 >= 120), Moderna OK, JYNNEOS OK
   delayed_6h (360 min) — Pfizer fires,  Moderna fires (360 > 240), JYNNEOS OK
+
+Service D tool → field mapping:
+  calculate_spoilage_time   : thaw_window_hours, final_destination_eta, excursion_minutes
+  find_alternative_carrier  : flight_icao, current_carrier, destination_facility_name,
+                               destination_address, total_units, total_weight_kg,
+                               pallet_dimensions
+  draft_hospital_notification: receiver_poc_name, receiver_poc_email,
+                               manufacturer_support_email, destination_facility_name,
+                               total_units
 """
 
 from __future__ import annotations
@@ -54,11 +63,11 @@ from pydantic import BaseModel, Field, field_validator
 # ---------------------------------------------------------------------------
 
 class TempClassification(str, Enum):
-    ULTRA_COLD      = "ultra_cold"       # -90°C to -60°C  (Pfizer COMIRNATY)
-    DEEP_FROZEN     = "deep_frozen"      # -50°C to -15°C  (Moderna, JYNNEOS)
-    REFRIGERATED    = "refrigerated"     # +2°C  to +8°C
-    ROOM_TEMP       = "room_temp"        # +15°C to +25°C
-    CONTROLLED_ROOM = "controlled_room"  # +20°C to +25°C (USP CRT)
+    ULTRA_COLD      = "ultra_cold"       # -90C to -60C  (Pfizer COMIRNATY)
+    DEEP_FROZEN     = "deep_frozen"      # -50C to -15C  (Moderna, JYNNEOS)
+    REFRIGERATED    = "refrigerated"     # +2C  to +8C
+    ROOM_TEMP       = "room_temp"        # +15C to +25C
+    CONTROLLED_ROOM = "controlled_room"  # +20C to +25C (USP CRT)
 
 
 class CargoCategory(str, Enum):
@@ -119,29 +128,28 @@ class ShipmentSchema(BaseModel):
     quantity_description: Optional[str] = Field(
         default=None,
         description=(
-            "e.g. '195 vials, 0.3 mL each'. Null if not stated in the label — "
-            "CDC storage summary PDFs typically do not include quantity information."
+            "Free-text quantity from the label e.g. '195 vials, 0.3 mL each'. "
+            "Null for CDC storage summary PDFs which omit quantity. "
+            "Use total_units for machine-readable unit count."
         )
     )
 
     # ------------------------------------------------------------------
-    # Notification contacts  [MANUAL — set in seed.py TRANSPORT_OVERRIDES]
-    # Consumed by Service E to alert the responsible party on any breach.
-    # Not extracted from PDFs — set per shipment by the operator.
+    # Sender-side operator contacts  [MANUAL]
+    # The cold-chain operator responsible for dispatching this shipment.
+    # Service E uses these to alert the sender-side party on breach.
     # ------------------------------------------------------------------
     contact_email: Optional[str] = Field(
         default=None,
         description=(
-            "Email address of the responsible party for this shipment. "
-            "Used by Service E to send breach notifications. "
+            "Email of the sender-side cold-chain operator. "
             "e.g. 'cold-chain-ops@pharmalogistics.com'"
         )
     )
     contact_phone: Optional[str] = Field(
         default=None,
         description=(
-            "Phone number of the responsible party for this shipment in E.164 format. "
-            "Used by Service E to send SMS/call notifications on breach. "
+            "Phone of the sender-side operator in E.164 format. "
             "e.g. '+12025551234'"
         )
     )
@@ -188,9 +196,9 @@ class ShipmentSchema(BaseModel):
     thaw_window_hours: Optional[int] = Field(
         default=None,
         description=(
-            "Hours the vaccine remains viable after confirmed thaw at 2-8°C. "
+            "Hours the vaccine remains viable after confirmed thaw at 2-8C. "
             "From PDF. Pfizer=1680 (10 wk), Moderna=720 (30 d), JYNNEOS=1344 (8 wk). "
-            "Context for Service D spoilage reasoning — NOT the alert threshold."
+            "Used by Service D calculate_spoilage_time — NOT the alert threshold."
         )
     )
     stability_note: Optional[str] = Field(
@@ -225,8 +233,6 @@ class ShipmentSchema(BaseModel):
     # ------------------------------------------------------------------
     # Parameter 4 — Excursion time
     # Threshold lives in max_excursion_duration_minutes above.
-    # Service C tracks cumulative out-of-range minutes per shipment in
-    # /monitoring_state/{drug_id} and fires breach.detected when exceeded.
     # ------------------------------------------------------------------
 
     # ------------------------------------------------------------------
@@ -264,10 +270,120 @@ class ShipmentSchema(BaseModel):
     )
 
     # ------------------------------------------------------------------
+    # Logistics & Routing  [MANUAL]
+    # Used by Service D find_alternative_carrier tool.
+    # ------------------------------------------------------------------
+    flight_icao: Optional[str] = Field(
+        default=None,
+        description=(
+            "ICAO flight number e.g. 'KAL82'. "
+            "Service D uses this to query real-time flight APIs (FlightAware, "
+            "AviationStack) for current position, ETA, and carrier contact details."
+        )
+    )
+    destination_facility_name: Optional[str] = Field(
+        default=None,
+        description=(
+            "Name of the receiving facility e.g. 'Johns Hopkins Central Pharmacy'. "
+            "Used in carrier booking and in the hospital notification draft."
+        )
+    )
+    destination_address: Optional[str] = Field(
+        default=None,
+        description=(
+            "Full street address of the destination facility. "
+            "Required by logistics APIs and last-mile carrier booking systems "
+            "to generate routing and quotes."
+        )
+    )
+    current_carrier: Optional[str] = Field(
+        default=None,
+        description=(
+            "Name of the carrier currently holding the shipment e.g. 'Delta Cargo'. "
+            "Service D needs this to issue a stop/hold order before rerouting."
+        )
+    )
+
+    # ------------------------------------------------------------------
+    # Cargo Specifications  [MANUAL]
+    # Used by Service D find_alternative_carrier and financial impact tools.
+    # ------------------------------------------------------------------
+    total_units: Optional[int] = Field(
+        default=None,
+        description=(
+            "Total number of vials in this shipment e.g. 15000. "
+            "Used to tell the receiving hospital how many replacement doses to order, "
+            "and to calculate financial loss (cost_per_vial * total_units)."
+        )
+    )
+    total_weight_kg: Optional[float] = Field(
+        default=None,
+        description=(
+            "Total shipment weight in kilograms e.g. 450.5. "
+            "Required by carrier quoting APIs — a carrier cannot confirm capacity "
+            "or price without knowing the payload weight."
+        )
+    )
+    pallet_dimensions: Optional[str] = Field(
+        default=None,
+        description=(
+            "Pallet dimensions as a string e.g. '48x40x60 inches'. "
+            "Required by logistics quoting APIs alongside weight to confirm "
+            "the shipment fits the alternative carrier's vehicle."
+        )
+    )
+
+    # ------------------------------------------------------------------
+    # Receiver-side stakeholder contacts  [MANUAL]
+    # Used by Service D draft_hospital_notification tool and Service E.
+    # Distinct from contact_email/contact_phone which are the sender-side operator.
+    # ------------------------------------------------------------------
+    receiver_poc_name: Optional[str] = Field(
+        default=None,
+        description=(
+            "Full name of the point of contact at the receiving facility "
+            "e.g. 'Dr. Sarah Jenkins'. Used to personalise the notification email — "
+            "'Dear Dr. Jenkins' rather than 'Dear Receiving Facility'."
+        )
+    )
+    receiver_poc_email: Optional[str] = Field(
+        default=None,
+        description=(
+            "Email address of the receiver POC. "
+            "Service E sends the hospital notification to this address via SendGrid."
+        )
+    )
+    manufacturer_support_email: Optional[str] = Field(
+        default=None,
+        description=(
+            "Emergency cold-chain support email for the drug manufacturer "
+            "e.g. 'coldchain-emergencies@pfizer.com'. "
+            "Service D drafts a secondary notification to the manufacturer "
+            "reporting the compromised lot for regulatory and stability investigation."
+        )
+    )
+
+    # ------------------------------------------------------------------
+    # Timing Context  [MANUAL]
+    # Used by Service D calculate_spoilage_time tool.
+    # ------------------------------------------------------------------
+    final_destination_eta: Optional[str] = Field(
+        default=None,
+        description=(
+            "ISO 8601 UTC timestamp of the scheduled arrival at the destination facility "
+            "e.g. '2026-04-06T18:00:00Z'. "
+            "Service D compares this against the current telemetry timestamp plus "
+            "flight_delay_status to calculate remaining transit time, then determines "
+            "whether the remaining cold-chain life (thaw_window_hours minus excursion "
+            "already consumed) can survive the rest of the journey."
+        )
+    )
+
+    # ------------------------------------------------------------------
     # Validators
     # ------------------------------------------------------------------
 
-    @field_validator("contact_email")
+    @field_validator("contact_email", "receiver_poc_email", "manufacturer_support_email")
     @classmethod
     def validate_email(cls, v: Optional[str]) -> Optional[str]:
         if v is None:
@@ -285,7 +401,6 @@ class ShipmentSchema(BaseModel):
     def validate_phone(cls, v: Optional[str]) -> Optional[str]:
         if v is None:
             return v
-        # E.164 format: + followed by 7-15 digits
         if not re.match(r"^\+[1-9]\d{6,14}$", v):
             raise ValueError(
                 f"'{v}' is not a valid E.164 phone number. "
@@ -297,7 +412,7 @@ class ShipmentSchema(BaseModel):
     @classmethod
     def validate_temp_range(cls, v: float) -> float:
         if v < -200 or v > 60:
-            raise ValueError(f"Temperature {v}°C is outside plausible range (-200°C to +60°C).")
+            raise ValueError(f"Temperature {v}C is outside plausible range (-200C to +60C).")
         return v
 
     @field_validator("max_excursion_duration_minutes")
@@ -312,6 +427,20 @@ class ShipmentSchema(BaseModel):
     def validate_flight_delay(cls, v: int) -> int:
         if v < 0 or v > 1440:
             raise ValueError("max_flight_delay_minutes must be 0-1440 (24 hours).")
+        return v
+
+    @field_validator("total_units")
+    @classmethod
+    def validate_total_units(cls, v: Optional[int]) -> Optional[int]:
+        if v is not None and v <= 0:
+            raise ValueError("total_units must be a positive integer.")
+        return v
+
+    @field_validator("total_weight_kg")
+    @classmethod
+    def validate_weight(cls, v: Optional[float]) -> Optional[float]:
+        if v is not None and v <= 0:
+            raise ValueError("total_weight_kg must be a positive number.")
         return v
 
     class Config:

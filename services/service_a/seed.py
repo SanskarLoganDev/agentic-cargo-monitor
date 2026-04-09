@@ -9,7 +9,8 @@ Pipeline per drug:
   2. Extract text with pypdf
   3. Claude extracts PDF-sourced fields (temperature, excursion, thaw window, etc.)
   4. Validate with Pydantic (ShipmentSchema)
-  5. Apply hardcoded transport parameters (humidity, shock, flight delay, contacts)
+  5. Apply hardcoded transport parameters (humidity, shock, flight delay, contacts,
+     logistics, cargo specs, timing)
   6. Write completed document to Firestore /shipments/{drug_id}
 
 Authentication:
@@ -90,16 +91,22 @@ SHIPMENTS = [
 # ---------------------------------------------------------------------------
 # Hardcoded transport parameters
 #
-# Drug labels never publish humidity limits, G-force ratings, delay tolerances,
-# or contact details. All of these are set here per shipment.
+# None of the fields below appear in drug label PDFs. All are set here
+# as demo/placeholder values for the three fixed shipments.
 #
-# contact_email / contact_phone — placeholder demo values.
-# Service E will read these from Firestore to send breach notifications.
-# Replace with real operator contacts before production use.
+# Sections:
+#   - Monitoring thresholds  (humidity, shock, flight delay)
+#   - Sender-side contacts   (contact_email, contact_phone)
+#   - Logistics & routing    (flight_icao, destination, carrier)
+#   - Cargo specifications   (total_units, weight, pallet_dimensions)
+#   - Receiver contacts      (receiver_poc_name, receiver_poc_email)
+#   - Manufacturer contact   (manufacturer_support_email)
+#   - Timing context         (final_destination_eta)
 # ---------------------------------------------------------------------------
 TRANSPORT_OVERRIDES: dict[str, dict] = {
 
     "pfizer-001": {
+        # ── Monitoring thresholds ────────────────────────────────────────
         "max_humidity_percent": 75.0,
         "humidity_alert_message": (
             "Humidity above 75% RH — condensation risk on ultra-cold vials at thaw. "
@@ -112,17 +119,34 @@ TRANSPORT_OVERRIDES: dict[str, dict] = {
         ),
         "max_flight_delay_minutes": 120,
         "flight_delay_spoilage_note": (
-            "Pfizer COMIRNATY stores at -90°C to -60°C with a 30-minute temperature "
+            "Pfizer COMIRNATY stores at -90C to -60C with a 30-minute temperature "
             "excursion window. A 2-hour flight delay means ambient exposure almost "
             "certainly exceeded the safe excursion limit. Verify cold chain logs "
             "immediately and prepare contingency cold storage at the receiving facility."
         ),
-        # Notification contacts — consumed by Service E for breach alerts
+        # ── Sender-side contacts ─────────────────────────────────────────
         "contact_email": "rohinv@umd.edu",
         "contact_phone": "+12408798960",
+        # ── Logistics & routing ──────────────────────────────────────────
+        "flight_icao":               "AAL292",
+        "destination_facility_name": "All India Institute of Medical Sciences Central Pharmacy",
+        "destination_address":       "Sri Aurobindo Marg, Ansari Nagar, New Delhi, 110029, India",
+        "current_carrier":           "American Airlines Cargo",
+        # ── Cargo specifications ─────────────────────────────────────────
+        "total_units":        15000,
+        "total_weight_kg":    450.5,
+        "pallet_dimensions":  "48x40x60 inches",
+        # ── Receiver contacts ────────────────────────────────────────────
+        "receiver_poc_name":  "Dr. Sanskar Vidyarthi",
+        "receiver_poc_email": "svidyar1@umd.edu",
+        # ── Manufacturer contact ─────────────────────────────────────────
+        "manufacturer_support_email": "dan0003@umd.edu",
+        # ── Timing context ───────────────────────────────────────────────
+        "final_destination_eta": "2026-04-06T18:00:00Z",
     },
 
     "moderna-001": {
+        # ── Monitoring thresholds ────────────────────────────────────────
         "max_humidity_percent": 75.0,
         "humidity_alert_message": (
             "Humidity above 75% RH — condensation risk on frozen mRNA vaccine. "
@@ -135,18 +159,35 @@ TRANSPORT_OVERRIDES: dict[str, dict] = {
         ),
         "max_flight_delay_minutes": 240,
         "flight_delay_spoilage_note": (
-            "Moderna Spikevax stores at -50°C to -15°C. A 4-hour flight delay "
+            "Moderna Spikevax stores at -50C to -15C. A 4-hour flight delay "
             "warrants cold chain assessment — ambient exposure risk is real at this "
             "duration. Once confirmed thawed, the vaccine is viable refrigerated at "
-            "2-8°C for up to 30 days. Verify whether dry ice or active refrigeration "
+            "2-8C for up to 30 days. Verify whether dry ice or active refrigeration "
             "was maintained throughout the delay before accepting the shipment."
         ),
-        # Notification contacts — consumed by Service E for breach alerts
+        # ── Sender-side contacts ─────────────────────────────────────────
         "contact_email": "dan0003@umd.edu",
         "contact_phone": "+12404137654",
+        # ── Logistics & routing ──────────────────────────────────────────
+        "flight_icao":               "UAL888",
+        "destination_facility_name": "Beijing Hospital Central Pharmacy",
+        "destination_address":       "No. 1 Dahua Road, Dongcheng District, Beijing, 100730, China",
+        "current_carrier":           "United Cargo",
+        # ── Cargo specifications ─────────────────────────────────────────
+        "total_units":        12000,
+        "total_weight_kg":    380.0,
+        "pallet_dimensions":  "48x40x55 inches",
+        # ── Receiver contacts ────────────────────────────────────────────
+        "receiver_poc_name":  "Dr. Rohin Vaidya",
+        "receiver_poc_email": "rohinv@umd.edu",
+        # ── Manufacturer contact ─────────────────────────────────────────
+        "manufacturer_support_email": "sumi0309@umd.edu",
+        # ── Timing context ───────────────────────────────────────────────
+        "final_destination_eta": "2026-04-06T20:30:00Z",
     },
 
     "jynneos-001": {
+        # ── Monitoring thresholds ────────────────────────────────────────
         "max_humidity_percent": 60.0,
         "humidity_alert_message": (
             "Humidity above 60% RH — JYNNEOS is a lyophilised vaccine. "
@@ -161,15 +202,31 @@ TRANSPORT_OVERRIDES: dict[str, dict] = {
         ),
         "max_flight_delay_minutes": 480,
         "flight_delay_spoilage_note": (
-            "JYNNEOS has an 8-week viability window after confirmed thaw at 2-8°C, "
+            "JYNNEOS has an 8-week viability window after confirmed thaw at 2-8C, "
             "making it the most delay-tolerant of the three shipments. An 8-hour "
             "threshold reflects this resilience. Note: JYNNEOS is lyophilised — "
             "humidity exposure during the delay is the primary risk. Inspect packaging "
             "integrity even when the delay threshold has not been exceeded."
         ),
-        # Notification contacts — consumed by Service E for breach alerts
+        # ── Sender-side contacts ─────────────────────────────────────────
         "contact_email": "sumi0309@umd.edu",
         "contact_phone": "+12027601163",
+        # ── Logistics & routing ──────────────────────────────────────────
+        "flight_icao":               "AAL61",
+        "destination_facility_name": "National Center for Global Health and Medicine Pharmacy",
+        "destination_address":       "1-21-1 Toyama, Shinjuku-ku, Tokyo, 162-8655, Japan",
+        "current_carrier":           "American Airlines Cargo",
+        # ── Cargo specifications ─────────────────────────────────────────
+        "total_units":        8000,
+        "total_weight_kg":    220.0,
+        "pallet_dimensions":  "48x40x48 inches",
+        # ── Receiver contacts ────────────────────────────────────────────
+        "receiver_poc_name":  "Dr. Dhanraj",
+        "receiver_poc_email": "dan0003@umd.edu",
+        # ── Manufacturer contact ─────────────────────────────────────────
+        "manufacturer_support_email": "svidyar1@umd.edu",
+        # ── Timing context ───────────────────────────────────────────────
+        "final_destination_eta": "2026-04-07T09:00:00Z",
     },
 }
 
@@ -331,15 +388,21 @@ def main() -> None:
             db.collection(FIRESTORE_COLLECTION).document(drug_id).set(doc_data)
 
             logger.info("Written → /shipments/%s — %s", drug_id, schema.drug_name)
-            logger.info("  [PDF]  temp:     %.1f°C to %.1f°C | excursion: %d min",
+            logger.info("  [PDF]  temp:        %.1fC to %.1fC | excursion: %d min",
                         schema.temp_min_celsius, schema.temp_max_celsius,
                         schema.max_excursion_duration_minutes)
-            logger.info("  [HARD] humidity: %.0f%% | shock: %.0fG | delay: %d min | "
-                        "contact: %s",
+            logger.info("  [HARD] humidity:    %.0f%% | shock: %.0fG | delay: %d min",
                         overrides["max_humidity_percent"],
                         overrides["max_shock_g"],
-                        overrides["max_flight_delay_minutes"],
-                        overrides["contact_email"])
+                        overrides["max_flight_delay_minutes"])
+            logger.info("  [MANUAL] carrier:   %s | flight: %s | units: %d | eta: %s",
+                        overrides["current_carrier"],
+                        overrides["flight_icao"],
+                        overrides["total_units"],
+                        overrides["final_destination_eta"])
+            logger.info("  [MANUAL] receiver:  %s <%s>",
+                        overrides["receiver_poc_name"],
+                        overrides["receiver_poc_email"])
 
             results["success"].append(drug_id)
 
@@ -358,14 +421,14 @@ def main() -> None:
 
     logger.info("")
     logger.info("Firestore documents ready:")
-    logger.info("  /shipments/pfizer-001   temp: -90 to -60°C | delay: 120 min (2h)")
-    logger.info("  /shipments/moderna-001  temp: -50 to -15°C | delay: 240 min (4h)")
-    logger.info("  /shipments/jynneos-001  temp: -25 to -15°C | delay: 480 min (8h)")
+    logger.info("  /shipments/pfizer-001   temp: -90 to -60C | delay: 120 min (2h) | carrier: Delta Cargo")
+    logger.info("  /shipments/moderna-001  temp: -50 to -15C | delay: 240 min (4h) | carrier: United Cargo")
+    logger.info("  /shipments/jynneos-001  temp: -25 to -15C | delay: 480 min (8h) | carrier: American Airlines Cargo")
     logger.info("")
     logger.info("Flight delay dropdown behaviour:")
-    logger.info("  on_time    (  0 min) → no drug triggers")
-    logger.info("  delayed_2h (120 min) → Pfizer fires,         Moderna OK, JYNNEOS OK")
-    logger.info("  delayed_6h (360 min) → Pfizer fires, Moderna fires,      JYNNEOS OK")
+    logger.info("  on_time    (  0 min) -> no drug triggers")
+    logger.info("  delayed_2h (120 min) -> Pfizer fires,         Moderna OK, JYNNEOS OK")
+    logger.info("  delayed_6h (360 min) -> Pfizer fires, Moderna fires,      JYNNEOS OK")
     logger.info("=" * 60)
 
 
