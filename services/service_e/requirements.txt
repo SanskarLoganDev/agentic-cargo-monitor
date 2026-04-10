@@ -1,0 +1,11 @@
+fastapi==0.115.6
+uvicorn[standard]==0.32.1
+anthropic==0.40.0
+google-cloud-firestore==2.19.0
+google-cloud-bigquery==3.25.0
+google-cloud-storage==2.18.0
+sendgrid==6.11.0
+twilio==9.3.5
+requests==2.32.3
+pydantic==2.10.4
+python-dotenv==1.0.1
