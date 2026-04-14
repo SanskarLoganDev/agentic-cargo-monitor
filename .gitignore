@@ -212,6 +212,7 @@ __marimo__/
 
 # Environment files — never commit secrets
 *.env
+*.env.yaml
 
 # Uploaded PDF files (user data, not source code)
 services/service_a/uploads/*.pdf
@@ -236,3 +237,5 @@ services/service_a/pdfs/*.PDF
 
 # Idea Project
 .idea
+
+.DS_STORE
