@@ -1,0 +1,82 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <%- include("partials/head") %>
+  <title>AgenticTerps – Dashboard</title>
+</head>
+<body>
+  <div class="app-shell">
+    <%- include("partials/sidebar") %>
+
+    <main class="main-content">
+      <h1 class="page-title">Dashboard</h1>
+
+      <!-- KPI CARDS -->
+      <div class="stats-grid stats-grid--two">
+        <div class="glass-card stat-card">
+          <h3>Active Shipments</h3>
+          <div class="stat-value"><%= activeShipmentsCount %></div>
+        </div>
+        <div class="glass-card stat-card">
+          <h3>Pending Approvals</h3>
+          <div class="stat-value"><%= typeof pendingApprovalsCount === 'number' ? pendingApprovalsCount : 0 %></div>
+          <% if (pendingApprovalsLabel) { %>
+            <p class="stat-subtext"><%= pendingApprovalsLabel %></p>
+          <% } %>
+        </div>
+      </div>
+
+      <!-- MEDICINE CARDS — dynamic, wraps every 3 -->
+      <div class="medicine-grid">
+        <% medicines.forEach(medicine => {
+          const statusClass = { 'In Transit': 'blue', 'Monitoring': 'amber', 'Stable': 'green' }[medicine.status] || 'blue';
+          const routeLabel = `${medicine.current_carrier || 'Unassigned'} -> ${medicine.destination_facility_name || 'Unknown destination'}`;
+          const needsAction = !!(actionNeededByMedicine && actionNeededByMedicine[medicine.id]);
+        %>
+          <a href="/shipment/<%= medicine.id %>" class="glass-card medicine-card <%= needsAction ? 'medicine-card--action-needed' : '' %>">
+            <% if (needsAction) { %>
+              <span class="medicine-alert-dot" aria-hidden="true"></span>
+            <% } %>
+            <h2><%= medicine.drug_name %></h2>
+            <p>Drug ID: <%= medicine.drug_id %></p>
+            <p class="route-label">Route</p>
+            <div class="route-value"><%= routeLabel %></div>
+            <div class="card-footer">
+              <span class="status-badge <%= statusClass %>"><%= medicine.status %></span>
+              <div class="eta-block">
+                <span>ETA</span>
+                <strong><%= new Date(medicine.final_destination_eta).toLocaleString() %></strong>
+              </div>
+            </div>
+            <div class="progress-bar">
+              <div class="progress-fill" style="width: 100%"></div>
+            </div>
+          </a>
+        <% }) %>
+
+        <% if (medicines.length === 0) { %>
+          <div class="glass-card stat-card" style="grid-column:1/-1; text-align:center; padding:40px;">
+            <p style="color:var(--muted);">No active shipments. Connect Firestore to load live data.</p>
+          </div>
+        <% } %>
+      </div>
+
+      <!-- METADATA SECTION -->
+      <div class="metadata-section">
+        <div class="metadata-tab">Metadata</div>
+        <div class="glass-card metadata-panel">
+          <div class="metadata-list">
+            <% medicines.forEach(medicine => { %>
+              <a href="/metadata/<%= medicine.id %>" class="metadata-pill">
+                <%= medicine.drug_name %>
+              </a>
+            <% }) %>
+          </div>
+        </div>
+      </div>
+    </main>
+  </div>
+
+  <%- include("partials/scripts") %>
+</body>
+</html>
