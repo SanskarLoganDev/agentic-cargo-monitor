@@ -1,0 +1,290 @@
+﻿<!DOCTYPE html>
+<html lang="en">
+<head>
+  <%- include("partials/head") %>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+  <title>AgenticTerps - <%= shipment.drug_name %> Shipment</title>
+</head>
+<body>
+  <div class="app-shell">
+    <%- include("partials/sidebar") %>
+
+    <main class="main-content">
+      <% const midTemp = ((shipment.temp_min_celsius + shipment.temp_max_celsius) / 2).toFixed(1); %>
+      <% const humidityStart = Math.round(shipment.max_humidity_percent * 0.6); %>
+      <% const shockStart = (shipment.max_shock_g * 0.2).toFixed(2); %>
+
+      <p class="breadcrumb">
+        <a href="/">Dashboard</a> /
+        <a href="/">Active Shipments</a> /
+        <span><%= shipment.drug_id %></span>
+      </p>
+
+      <div class="page-header-row page-header-actions" style="margin-bottom: 28px;">
+        <div class="page-header-row" style="justify-content:flex-start; gap:12px; flex:1;">
+          <h1 class="page-title" style="margin-bottom: 0;"><%= shipment.drug_name %></h1>
+          <button class="actions-trigger-button <%= hasPendingApproval ? 'actions-trigger-button--alert' : '' %>" type="button" onclick="openActionModal()">Actions</button>
+        </div>
+        <button
+          class="save-updates-btn"
+          id="saveUpdatesBtn"
+          data-save-updates
+          data-medicine-key="<%= medicineKey %>"
+          disabled
+          type="button"
+        >
+          Save Updates
+        </button>
+      </div>
+
+      <div class="shipment-body">
+        <div class="medicine-grid params-grid">
+        <div class="glass-card metric-card">
+          <h3>temperature_celsius</h3>
+          <p>Cold storage target</p>
+          <div class="metric-big" data-temp-display><%= midTemp %>&deg;C</div>
+          <p class="metric-sub">Safe range (<%= shipment.temp_min_celsius %>&deg;C &ndash; <%= shipment.temp_max_celsius %>&deg;C)</p>
+          <input
+            class="styled-range"
+            type="range"
+            data-temp-range
+            min="<%= shipment.temp_min_celsius - 40 %>"
+            max="<%= shipment.temp_max_celsius + 40 %>"
+            step="0.1"
+            value="<%= midTemp %>"
+            aria-label="Temperature celsius"
+          />
+          <p class="metric-sub">Actively adjustable threshold</p>
+        </div>
+
+        <div class="glass-card metric-card">
+          <h3>max_humidity_percent</h3>
+          <div class="humidity-wrap">
+            <div class="humidity-bubble" data-humidity-bubble><%= humidityStart %>%</div>
+            <div class="humidity-safe-box"></div>
+            <input
+              class="styled-range humidity-range"
+              type="range"
+              data-humidity-range
+              min="0"
+              max="100"
+              step="1"
+              value="<%= humidityStart %>"
+              aria-label="Humidity percent"
+            />
+          </div>
+          <p class="metric-sub">Allowed maximum humidity threshold</p>
+          <p class="metric-sub">Safe range (0% &ndash; <%= shipment.max_humidity_percent %>% RH)</p>
+        </div>
+
+        <div class="glass-card telemetry-card">
+          <h3>Telemetry trend view</h3>
+          <div class="telemetry-charts">
+            <div class="telemetry-chart-block">
+              <span class="telemetry-label temp-label">● Temperature</span>
+              <canvas id="tempChart" height="80"></canvas>
+            </div>
+            <div class="telemetry-chart-block">
+              <span class="telemetry-label humidity-label">● Humidity</span>
+              <canvas id="humidityChart" height="80"></canvas>
+            </div>
+          </div>
+        </div>
+
+        <div class="glass-card metric-card">
+          <h3>max_shock_g</h3>
+          <p>Sample</p>
+          <div class="metric-big" data-shock-display><%= shockStart %>G</div>
+          <p class="metric-sub">Safe range (0.00G &ndash; <%= shipment.max_shock_g %>.00G)</p>
+          <input
+            class="styled-range"
+            type="range"
+            data-shock-range
+            min="0"
+            max="<%= shipment.max_shock_g * 6 %>"
+            step="0.01"
+            value="<%= shockStart %>"
+            aria-label="Shock g force"
+          />
+          <div class="page-header-row">
+            <p class="metric-sub">Actively adjustable threshold</p>
+            <p class="metric-sub"><%= shipment.max_shock_g * 6 %>G+</p>
+          </div>
+        </div>
+
+        <div class="glass-card metric-card">
+          <h3>max_excursion_duration_minutes</h3>
+          <div class="pill-number" style="margin-top:28px;"><%= shipment.max_excursion_duration_minutes %> min</div>
+          <p class="metric-sub">Configured excursion window</p>
+          <p class="metric-sub">Computed by Monitoring Agent (read-only)</p>
+        </div>
+
+        <div class="glass-card delay-card">
+          <h3>flight_delay_status</h3>
+          <select class="flight-status-select" aria-label="Flight delay status">
+            <option value="on_time" selected>✅ On Time</option>
+            <option value="minor_delay">⚠️ Minor Delay (&lt;1hr)</option>
+            <option value="major_delay">🔴 Major Delay (&gt;1hr)</option>
+            <option value="diverted">🚨 Diverted</option>
+          </select>
+          <p class="metric-sub">Flight: <%= shipment.flight_icao %></p>
+          <p class="metric-sub">Threshold: <%= shipment.max_flight_delay_minutes %> min</p>
+        </div>
+        </div>
+
+        <div class="shipment-sidebar">
+          <div class="glass-card shipment-meta shipment-metadata-card">
+            <h3>Shipment Metadata</h3>
+            <div class="shipment-metadata-list">
+              <div class="shipment-metadata-row"><span class="shipment-metadata-label">id</span><span class="shipment-metadata-value"><%= shipment.id %></span></div>
+              <div class="shipment-metadata-row"><span class="shipment-metadata-label">drug_id</span><span class="shipment-metadata-value"><%= shipment.drug_id %></span></div>
+              <div class="shipment-metadata-row"><span class="shipment-metadata-label">destination_facility_name</span><span class="shipment-metadata-value"><%= shipment.destination_facility_name %></span></div>
+              <div class="shipment-metadata-row"><span class="shipment-metadata-label">current_carrier</span><span class="shipment-metadata-value"><%= shipment.current_carrier %></span></div>
+              <div class="shipment-metadata-row"><span class="shipment-metadata-label">total_weight_kg</span><span class="shipment-metadata-value"><%= shipment.total_weight_kg %> kg</span></div>
+              <div class="shipment-metadata-row"><span class="shipment-metadata-label">total_units</span><span class="shipment-metadata-value"><%= shipment.total_units %></span></div>
+              <div class="shipment-metadata-row"><span class="shipment-metadata-label">final_destination_eta</span><span class="shipment-metadata-value"><%= new Date(shipment.final_destination_eta).toLocaleString() %></span></div>
+              <div class="shipment-metadata-row"><span class="shipment-metadata-label">seeded_at</span><span class="shipment-metadata-value"><%= shipment.seeded_at?._seconds ? new Date(shipment.seeded_at._seconds * 1000).toLocaleDateString() : 'N/A' %></span></div>
+              <div class="shipment-metadata-row"><span class="shipment-metadata-label">status</span><span class="shipment-metadata-value"><%= shipment.status %></span></div>
+            </div>
+            <a href="/metadata/<%= medicineKey %>" class="action-btn secondary" style="display:block; margin-top:16px; text-align:center;">View Metadata</a>
+          </div>
+
+        </div>
+      </div>
+
+      <div id="actionRequiredModal" class="approval-modal" hidden>
+        <div class="approval-modal-card glass-card">
+          <div class="page-header-row" style="margin-bottom:12px;">
+            <h3 style="margin:0;"><%= hasPendingApproval ? 'Action Required' : "Everything's Good" %></h3>
+            <button type="button" class="action-btn secondary" style="margin-top:0; width:auto; padding:8px 12px;" onclick="closeActionModal()">Close</button>
+          </div>
+
+          <% if (!hasPendingApproval) { %>
+            <p class="approval-subtext">No action is needed right now.</p>
+          <% } %>
+
+          <% if (hasPendingApproval) { %>
+            <p class="approval-subtext">Action required &ndash; Approve AI recovery plan</p>
+            <div class="actions-modal-buttons">
+              <button class="btn-approve-action" id="modalApproveBtn" onclick="handleApprove('<%= medicineKey %>')">
+                Approve Action
+              </button>
+              <button class="btn-escalate" id="modalViewActionsBtn" onclick="toggleApprovalActions()">
+                View Actions
+              </button>
+            </div>
+            <p class="approval-feedback" id="approvalFeedback"></p>
+            <div id="approvalActionsPanel" class="approval-actions-panel" hidden>
+              <p class="approval-actions-title">AI Notification Actions</p>
+              <% if (pendingApprovalItems && pendingApprovalItems.length) { %>
+                <% pendingApprovalItems.forEach(item => { %>
+                  <div class="approval-item">
+                    <p class="approval-actions-note" style="margin-bottom:6px;">Request ID: <%= item.approval_id || item.id || 'N/A' %></p>
+                    <% if (item.status) { %>
+                      <p class="approval-actions-note" style="margin-bottom:6px;">Status: <%= item.status %></p>
+                    <% } %>
+                    <% 
+                      const createdAtRaw = item.created_at || item.createdAt || item.submittedAt || item.timestamp;
+                      let createdAtText = '';
+                      if (createdAtRaw) {
+                        if (typeof createdAtRaw === 'string' || typeof createdAtRaw === 'number') {
+                          createdAtText = new Date(createdAtRaw).toLocaleString();
+                        } else if (createdAtRaw._seconds) {
+                          createdAtText = new Date(createdAtRaw._seconds * 1000).toLocaleString();
+                        } else if (createdAtRaw.seconds) {
+                          createdAtText = new Date(createdAtRaw.seconds * 1000).toLocaleString();
+                        }
+                      }
+                    %>
+                    <% if (createdAtText) { %>
+                      <p class="approval-actions-note" style="margin-bottom:6px;">Created at: <%= createdAtText %></p>
+                    <% } %>
+                    <% if (item.uiSummaryView && item.uiSummaryView.type === 'text') { %>
+                      <p class="approval-actions-note" style="margin-bottom:6px;"><%= item.uiSummaryView.text %></p>
+                    <% } else if (item.uiSummaryView && item.uiSummaryView.type === 'entries' && item.uiSummaryView.entries?.length) { %>
+                      <ul class="approval-actions-list">
+                        <% item.uiSummaryView.entries.forEach(row => { %>
+                          <li><strong><%= row.key %>:</strong> <%= row.value %></li>
+                        <% }) %>
+                      </ul>
+                    <% } else if (item.uiSummaryView && item.uiSummaryView.type === 'list' && item.uiSummaryView.items?.length) { %>
+                      <ul class="approval-actions-list">
+                        <% item.uiSummaryView.items.forEach(line => { %>
+                          <li><%= line %></li>
+                        <% }) %>
+                      </ul>
+                    <% } else { %>
+                      <p class="approval-actions-note">No UI summary available</p>
+                    <% } %>
+                  </div>
+                <% }) %>
+                <p class="approval-actions-title" style="margin-top:10px;">Notification Recipients</p>
+                <ul class="approval-actions-list">
+                  <% if (shipment.contact_email) { %><li><strong>Primary contact email:</strong> <%= shipment.contact_email %></li><% } %>
+                  <% if (shipment.contact_phone) { %><li><strong>Primary contact phone:</strong> <%= shipment.contact_phone %></li><% } %>
+                  <% if (shipment.receiver_poc_name || shipment.receiver_poc_email) { %>
+                    <li>
+                      <strong>Receiving facility contact:</strong>
+                      <%= shipment.receiver_poc_name || 'N/A' %><% if (shipment.receiver_poc_email) { %> (<%= shipment.receiver_poc_email %>)<% } %>
+                    </li>
+                  <% } %>
+                  <% if (shipment.manufacturer_support_email) { %><li><strong>Manufacturer support:</strong> <%= shipment.manufacturer_support_email %></li><% } %>
+                </ul>
+              <% } else { %>
+                <p class="approval-actions-note">No pending approval details available.</p>
+              <% } %>
+              <p class="approval-actions-note">Read-only preview of downstream notification workflow</p>
+            </div>
+          <% } %>
+        </div>
+      </div>
+    </main>
+  </div>
+
+  <%- include("partials/scripts") %>
+  <script>
+    function openActionModal() {
+      const modal = document.getElementById('actionRequiredModal');
+      if (modal) modal.hidden = false;
+    }
+
+    function closeActionModal() {
+      const modal = document.getElementById('actionRequiredModal');
+      if (modal) modal.hidden = true;
+    }
+
+    function handleApprove(medicineKey) {
+      const btn = document.getElementById('modalApproveBtn');
+      const feedback = document.getElementById('approvalFeedback');
+      if (!btn || !feedback) return;
+      btn.disabled = true;
+      btn.textContent = 'Approving...';
+      fetch('/api/shipment/' + medicineKey + '/approve-action', { method: 'POST' })
+        .then(r => r.json())
+        .then((result) => {
+          if (!result?.ok) {
+            throw new Error('Could not send approval. Please try again.');
+          }
+          btn.classList.add('is-success');
+          btn.textContent = 'Approved';
+          feedback.textContent = result.approval_id
+            ? ('Okay, approved! (' + result.approval_id + ')')
+            : 'Okay, approved!';
+        })
+        .catch(() => {
+          btn.disabled = false;
+          btn.textContent = 'Approve Action';
+          feedback.textContent = 'Could not send approval. Please try again.';
+        });
+    }
+
+    function toggleApprovalActions() {
+      const panel = document.getElementById('approvalActionsPanel');
+      if (!panel) return;
+      panel.hidden = !panel.hidden;
+    }
+
+  </script>
+</body>
+</html>
+

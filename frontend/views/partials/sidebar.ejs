@@ -1,0 +1,45 @@
+<aside class="sidebar<% if (typeof sidebarCollapsed !== 'undefined' && sidebarCollapsed) { %> sidebar--collapsed<% } %>">
+
+  <div class="brand">
+    <div class="brand-logo">A</div>
+    <div class="brand-text">AgenticTerps</div>
+  </div>
+
+  <% if (typeof sidebarCollapsed !== 'undefined' && sidebarCollapsed) { %>
+    <button
+      class="back-btn"
+      id="backBtn"
+      type="button"
+      aria-label="Go back to previous page"
+      title="Go back"
+    >
+      <svg width="18" height="18" viewBox="0 0 24 24" fill="none"
+           stroke="currentColor" stroke-width="2.2"
+           stroke-linecap="round" stroke-linejoin="round">
+        <path d="M19 12H5"/>
+        <path d="M12 19l-7-7 7-7"/>
+      </svg>
+    </button>
+  <% } %>
+
+  <% if (typeof showUpload !== 'undefined' && showUpload) { %>
+
+    <div class="upload-card">
+      <div class="upload-icon">⤴</div>
+      <h3>Upload PDF Manifest</h3>
+      <p>Drop or browse shipment file</p>
+      <form id="uploadForm" class="upload-form" enctype="multipart/form-data">
+        <input type="file" id="manifestFile" name="file" accept="application/pdf" />
+        <button type="submit" class="primary-btn">Upload PDF</button>
+      </form>
+      <div id="uploadStatus" class="upload-status"></div>
+    </div>
+
+    <div class="future-panel">
+      <h4>Future Alerts</h4>
+      <p>Pub/Sub risk notifications, email alerts, and escalation feed can plug in here later.</p>
+    </div>
+
+  <% } %>
+
+</aside>

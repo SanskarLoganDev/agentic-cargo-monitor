@@ -1,0 +1,108 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <%- include("partials/head") %>
+  <title>AgenticTerps - <%= metadata.drug_name %> Metadata</title>
+</head>
+<body>
+  <div class="app-shell">
+    <%- include("partials/sidebar") %>
+
+    <main class="main-content metadata-detail-page">
+
+      <p class="breadcrumb">
+        <a href="/">Dashboard</a> /
+        <a href="/">Metadata</a> /
+        <span><%= metadata.drug_name %></span>
+      </p>
+
+      <div class="page-header-row" style="margin-bottom:6px;">
+        <h1 class="page-title" style="margin-bottom:0;">
+          Firestore Metadata - <%= metadata.drug_name %>
+        </h1>
+        <span class="readonly-chip">Read-only</span>
+      </div>
+      <p class="page-subtitle" style="margin-bottom:28px;">Live document view for selected shipment</p>
+
+      <div class="glass-card meta-section" style="margin-bottom:20px;">
+        <div class="section-header-row" style="margin-bottom:18px;">
+          <h2 style="margin:0; font-size:18px;">Shipment Core</h2>
+          <span class="readonly-chip">Read-only</span>
+        </div>
+        <div class="two-col-grid">
+          <div>
+            <div class="field-row"><span>id</span><span><%= metadata.id %></span></div>
+            <div class="field-row"><span>drug_id</span><span><%= metadata.drug_id %></span></div>
+            <div class="field-row"><span>drug_name</span><span><%= metadata.drug_name %></span></div>
+            <div class="field-row"><span>manufacturer</span><span><%= metadata.manufacturer %></span></div>
+            <div class="field-row"><span>cargo_category</span><span><%= metadata.cargo_category %></span></div>
+            <div class="field-row"><span>status</span><span><%= metadata.status %></span></div>
+          </div>
+          <div>
+            <div class="field-row"><span>current_carrier</span><span><%= metadata.current_carrier %></span></div>
+            <div class="field-row"><span>destination_facility_name</span><span><%= metadata.destination_facility_name %></span></div>
+            <div class="field-row"><span>destination_address</span><span><%= metadata.destination_address %></span></div>
+            <div class="field-row"><span>final_destination_eta</span><span><%= new Date(metadata.final_destination_eta).toLocaleString() %></span></div>
+            <div class="field-row"><span>total_units</span><span><%= metadata.total_units %></span></div>
+            <div class="field-row"><span>total_weight_kg</span><span><%= metadata.total_weight_kg %> kg</span></div>
+          </div>
+        </div>
+        <p class="section-note">Data pulled in real time from Firestore</p>
+      </div>
+
+      <div class="glass-card meta-section" style="margin-bottom:20px;">
+        <h2 style="margin:0 0 18px; font-size:18px;">Cold Chain Thresholds</h2>
+        <div class="two-col-grid">
+          <div>
+            <div class="field-row"><span>temp_classification</span><span><%= metadata.temp_classification %></span></div>
+            <div class="field-row"><span>temp_min_celsius</span><span><%= metadata.temp_min_celsius %></span></div>
+            <div class="field-row"><span>temp_max_celsius</span><span><%= metadata.temp_max_celsius %></span></div>
+            <div class="field-row"><span>freeze_threshold_celsius</span><span><%= metadata.freeze_threshold_celsius ?? 'N/A' %></span></div>
+            <div class="field-row"><span>do_not_freeze</span><span><%= metadata.do_not_freeze ? 'Yes' : 'No' %></span></div>
+            <div class="field-row"><span>max_excursion_duration_minutes</span><span><%= metadata.max_excursion_duration_minutes %></span></div>
+          </div>
+          <div>
+            <div class="field-row"><span>max_shock_g</span><span><%= metadata.max_shock_g %></span></div>
+            <div class="field-row"><span>max_humidity_percent</span><span><%= metadata.max_humidity_percent %></span></div>
+            <div class="field-row"><span>max_flight_delay_minutes</span><span><%= metadata.max_flight_delay_minutes %></span></div>
+            <div class="field-row"><span>light_sensitive</span><span><%= metadata.light_sensitive ? 'Yes' : 'No' %></span></div>
+            <div class="field-row"><span>thaw_window_hours</span><span><%= metadata.thaw_window_hours %></span></div>
+            <div class="field-row"><span>shelf_life_days</span><span><%= metadata.shelf_life_days ?? 'N/A' %></span></div>
+          </div>
+        </div>
+      </div>
+
+      <div class="glass-card meta-section">
+        <h2 style="margin:0 0 18px; font-size:18px;">Handling, Notes, and Contact</h2>
+        <div class="two-col-grid">
+          <div>
+            <div class="field-row"><span>pallet_dimensions</span><span><%= metadata.pallet_dimensions %></span></div>
+            <div class="field-row"><span>regulatory_framework</span><span><%= metadata.regulatory_framework %></span></div>
+            <div class="field-row"><span>iata_handling_codes</span><span><%= metadata.iata_handling_codes?.join(', ') || 'None' %></span></div>
+            <div class="field-row"><span>batch_numbers</span><span><%= metadata.batch_numbers?.join(', ') || 'None' %></span></div>
+            <div class="field-row"><span>quantity_description</span><span><%= metadata.quantity_description ?? 'N/A' %></span></div>
+            <div class="field-row"><span>pdf_source</span><span class="field-url"><%= metadata.pdf_source %></span></div>
+            <div class="field-row"><span>flight_icao</span><span><%= metadata.flight_icao %></span></div>
+            <div class="field-row"><span>seeded_at</span><span><%= metadata.seeded_at?._seconds ? new Date(metadata.seeded_at._seconds * 1000).toLocaleDateString() : 'N/A' %></span></div>
+          </div>
+          <div>
+            <div class="field-row"><span>special_instructions</span><span><%= metadata.special_instructions %></span></div>
+            <div class="field-row"><span>stability_note</span><span><%= metadata.stability_note %></span></div>
+            <div class="field-row"><span>shock_alert_message</span><span><%= metadata.shock_alert_message %></span></div>
+            <div class="field-row"><span>humidity_alert_message</span><span><%= metadata.humidity_alert_message %></span></div>
+            <div class="field-row"><span>flight_delay_spoilage_note</span><span><%= metadata.flight_delay_spoilage_note %></span></div>
+            <div class="field-row"><span>contact_phone</span><span><%= metadata.contact_phone %></span></div>
+            <div class="field-row"><span>contact_email</span><span><%= metadata.contact_email %></span></div>
+            <div class="field-row"><span>receiver_poc_name</span><span><%= metadata.receiver_poc_name %></span></div>
+            <div class="field-row"><span>receiver_poc_email</span><span><%= metadata.receiver_poc_email %></span></div>
+            <div class="field-row"><span>manufacturer_support_email</span><span><%= metadata.manufacturer_support_email %></span></div>
+          </div>
+        </div>
+      </div>
+
+    </main>
+  </div>
+
+  <%- include("partials/scripts") %>
+</body>
+</html>
