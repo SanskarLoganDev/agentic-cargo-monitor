@@ -380,7 +380,7 @@ resource "google_pubsub_subscription" "risk_detected_sub" {
   message_retention_duration = "600s"
 
   push_config {
-    push_endpoint = var.service_d_url != "" ? "${var.service_d_url}/risk-detected" : "https://placeholder.invalid/risk-detected"
+    push_endpoint = var.service_d_url != "" ? "${var.service_d_url}/pubsub/risk" : "https://placeholder.invalid/risk-detected"
     oidc_token {
       service_account_email = google_service_account.service_d.email
     }
