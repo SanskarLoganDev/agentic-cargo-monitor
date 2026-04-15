@@ -20,7 +20,7 @@ RUN addgroup --system appgroup \
 WORKDIR /app
 
 COPY --from=builder /install /usr/local
-COPY main.py content_gen.py notifications.py compliance.py .
+COPY main.py notifications.py compliance.py .
 
 ENV PORT=8080
 ENV PYTHONUNBUFFERED=1
