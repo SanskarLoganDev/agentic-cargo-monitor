@@ -5,4 +5,4 @@ firestore_location = "nam5"
 # Fill these in after deploying each Cloud Run service:
 service_c_url = ""   # e.g. "https://service-c-monitoring-abc123-uc.a.run.app"
 service_d_url = ""   # e.g. "https://service-d-orchestrator-abc123-uc.a.run.app"
-service_e_url = ""   # e.g. "https://service-e-execution-abc123-uc.a.run.app"
+service_e_url = "https://service-e-execution-446629917893.us-central1.run.app"   # e.g. "https://service-e-execution-abc123-uc.a.run.app"
