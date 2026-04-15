@@ -1,0 +1,12 @@
+fastapi==0.115.6
+uvicorn[standard]==0.32.1
+google-cloud-firestore==2.20.1
+google-cloud-pubsub==2.27.1
+anthropic==0.43.0
+langchain==0.3.14
+langchain-anthropic==0.3.3
+langchain-core>=0.3.30,<0.4.0
+pydantic==2.10.5
+pydantic-settings==2.7.0
+httpx==0.28.1
+python-dotenv==1.0.1

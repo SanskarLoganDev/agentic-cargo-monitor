@@ -449,3 +449,192 @@ class ShipmentSchema(BaseModel):
     def to_firestore_dict(self) -> dict:
         """Return a plain dict suitable for Firestore. Enums serialised to strings."""
         return self.model_dump()
+
+# ===========================================================================
+# Pending Approvals Collection Helpers
+# Added for Service D — these write/read from /pending-approvals/{approval_id}
+# ===========================================================================
+
+PENDING_APPROVALS_COLLECTION = "pending-approvals"
+
+
+class PendingApprovalStatus(str, Enum):
+    """Lifecycle states for a pending approval document."""
+    PENDING  = "pending"    # Written by Service D — awaiting human decision
+    APPROVED = "approved"   # Human clicked Approve — Service E triggered via Firestore listener
+    REJECTED = "rejected"   # Human clicked Reject — logged only, no execution
+
+
+def write_pending_approval(db, approval_id: str, data: dict) -> None:
+    """
+    Write a pending approval document to Firestore.
+
+    Args:
+        db: google.cloud.firestore.Client instance
+        approval_id: UUID string used as the Firestore document ID
+        data: Dict from PendingApprovalSchema.to_firestore_dict()
+    """
+    import logging
+    from google.cloud import firestore as _firestore
+
+    logger = logging.getLogger(__name__)
+    doc_ref = db.collection(PENDING_APPROVALS_COLLECTION).document(approval_id)
+    data["created_at_server"] = _firestore.SERVER_TIMESTAMP
+    doc_ref.set(data)
+    logger.info(
+        "Wrote /pending-approvals/%s (drug=%s, status=%s)",
+        approval_id,
+        data.get("drug_id"),
+        data.get("status"),
+    )
+
+
+def get_pending_approval(db, approval_id: str) -> Optional[dict]:
+    """
+    Fetch a single pending approval document by ID.
+
+    Returns:
+        Dict of document fields, or None if not found.
+    """
+    doc_ref = db.collection(PENDING_APPROVALS_COLLECTION).document(approval_id)
+    doc = doc_ref.get()
+    return doc.to_dict() if doc.exists else None
+
+
+def update_approval_status(db, approval_id: str, new_status: PendingApprovalStatus) -> None:
+    """
+    Update the status field of a pending approval.
+    The frontend calls this when the operator clicks Approve or Reject.
+    Service E listens for transitions to 'approved' via a Firestore trigger.
+
+    Args:
+        db: Firestore client
+        approval_id: Document ID
+        new_status: One of PendingApprovalStatus enum values
+    """
+    import logging
+    from google.cloud import firestore as _firestore
+
+    logger = logging.getLogger(__name__)
+    doc_ref = db.collection(PENDING_APPROVALS_COLLECTION).document(approval_id)
+    doc_ref.update({
+        "status": new_status.value,
+        "updated_at_server": _firestore.SERVER_TIMESTAMP,
+    })
+    logger.info("Updated /pending-approvals/%s status → %s", approval_id, new_status.value)
+
+
+def list_pending_approvals(db, status_filter: str = "pending") -> list[dict]:
+    """
+    List all pending approval documents with the given status.
+    The frontend uses this for initial load; real-time updates come from Firestore listeners.
+
+    Args:
+        db: Firestore client
+        status_filter: Filter by status string (default 'pending')
+
+    Returns:
+        List of document dicts including the document ID as 'approval_id'.
+    """
+    query = (
+        db.collection(PENDING_APPROVALS_COLLECTION)
+        .where("status", "==", status_filter)
+        .order_by("created_at_server", direction="DESCENDING")
+        .limit(50)
+    )
+    results = []
+    for doc in query.stream():
+        data = doc.to_dict()
+        data["approval_id"] = doc.id
+        results.append(data)
+    return results
+
+
+APPROVED_ACTIONS_COLLECTION = "approved-actions"
+
+
+def write_approved_action(db, approval_id: str, approved_by: str = "operator") -> None:
+    """
+    Called by Service E after the human operator clicks Approve.
+    The /approved-actions/{approval_id} document already exists (created by Service D).
+    This function simply updates it with approval metadata and updates the
+    status in /pending-approvals to 'approved' as well.
+    """
+    import logging
+    from google.cloud import firestore as _firestore
+
+    logger = logging.getLogger(__name__)
+
+    # Update the already-existing approved-actions placeholder
+    dst_ref = db.collection(APPROVED_ACTIONS_COLLECTION).document(approval_id)
+    if not dst_ref.get().exists:
+        logger.error(
+            "write_approved_action: /approved-actions/%s placeholder not found — "
+            "was Service D run correctly?", approval_id
+        )
+        return
+
+    dst_ref.update({
+        "status":           "approved",
+        "approved_at":      _firestore.SERVER_TIMESTAMP,
+        "approved_by":      approved_by,
+    })
+
+    # Mirror status update in pending-approvals
+    src_ref = db.collection(PENDING_APPROVALS_COLLECTION).document(approval_id)
+    if src_ref.get().exists:
+        src_ref.update({
+            "status":      "approved",
+            "approved_at": _firestore.SERVER_TIMESTAMP,
+        })
+
+    logger.info(
+        "Approved: /approved-actions/%s updated (approved_by=%s), "
+        "/pending-approvals/%s status → approved",
+        approval_id, approved_by, approval_id,
+    )
+
+
+def append_executed_action(db, approval_id: str, executed_step: dict) -> None:
+    """
+    Called by Service E once per recovery_action it executes.
+    Appends the result of each step to the executed_actions list.
+
+    executed_step example:
+        {
+            "step": 1,
+            "action_type": "NOTIFY_RECEIVER",
+            "result": "email_sent",
+            "timestamp": "2026-04-15T11:30:00+00:00",
+            "detail": "Email delivered to svidyar1@umd.edu"
+        }
+    """
+    import logging
+    from google.cloud import firestore as _firestore
+
+    logger = logging.getLogger(__name__)
+
+    dst_ref = db.collection(APPROVED_ACTIONS_COLLECTION).document(approval_id)
+    dst_ref.update({
+        "executed_actions": _firestore.ArrayUnion([executed_step])
+    })
+    logger.info(
+        "Appended executed step %s to /approved-actions/%s",
+        executed_step.get("action_type"), approval_id,
+    )
+
+
+def list_approved_actions(db, limit: int = 50) -> list[dict]:
+    """Return the most recent approved+executed actions for the compliance audit log."""
+    query = (
+        db.collection(APPROVED_ACTIONS_COLLECTION)
+        .where("status", "==", "approved")
+        .order_by("approved_at", direction="DESCENDING")
+        .limit(limit)
+    )
+    results = []
+    for doc in query.stream():
+        data = doc.to_dict()
+        data["approval_id"] = doc.id
+        results.append(data)
+    return results
