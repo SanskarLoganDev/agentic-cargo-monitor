@@ -1,11 +1,12 @@
 """
 Service E — Execution Agent
 FastAPI microservice. Receives Pub/Sub PUSH from execute-actions,
-generates notification content via Claude, executes all three notification
-channels (email, SMS, voice), writes to BigQuery audit log, and updates
-the Firestore approval status.
+iterates over the recovery_actions list produced by Service D, sends emails
+for actions that have pre-written recipient/subject/body, delivers a voice
+notification to the primary contact, writes to BigQuery, and marks the
+Firestore document as completed.
 
-Pub/Sub push envelope (identical structure to Service C):
+Pub/Sub push envelope:
 {
   "message": { "data": "<base64 JSON>", "messageId": "...", "publishTime": "..." },
   "subscription": "projects/.../subscriptions/execute-actions-sub"
@@ -13,49 +14,59 @@ Pub/Sub push envelope (identical structure to Service C):
 
 Expected decoded payload (published by Service D after human approval):
 {
-  "approval_id":     "uuid",
-  "approved_by":     "operator name",
-  "approved_at":     "2026-04-05T10:30:00Z",
-  "drug_id":         "pfizer-001",
-  "drug_name":       "COMIRNATY (BNT162b2)",
-  "manufacturer":    "Pfizer-BioNTech",
-  "cargo_category":  "vaccine",
-  "risk_level":      "CRITICAL",
-  "overall_assessment": "...",
-  "breaches":        [...],
-  "compound_risk_note": "...",
-  "recommended_actions": [...],
-  "mitigation_plan": "Service D's generated recovery plan",
-  "spoilage_likelihood": "PROBABLE",
-  "estimated_viable_units_percent": 45,
-  "regulatory_flags": [...],
-  "contact_email":   "operator@example.com",
-  "contact_phone":   "+12025551234",
-  "telemetry":       {...},
-  "thresholds":      {...},
-  "iata_codes":      [...],
-  "regulatory_framework": "EU GDP 2013/C 343/01"
+  "drug_id":            "pfizer-001",
+  "drug_name":          "COMIRNATY (BNT162b2)",
+  "document_id":        "firestore-doc-id",   <- pending_approvals document to mark completed
+  "approval_id":        "uuid",               <- fallback if document_id absent
+  "approved_by":        "operator name",
+  "risk_level":         "CRITICAL",
+  "contact_phone":      "+12408798960",        <- fallback for voice notification
+  "agent_summary":      "...",                 <- Service D narrative summary
+  "spoilage_assessment": "...",               <- Service D spoilage analysis
+  "recovery_actions": [
+    {
+      "step":            1,
+      "action_type":     "QUARANTINE" | "CONTACT_CARRIER" | "NOTIFY_RECEIVER" |
+                         "NOTIFY_MANUFACTURER" | "NOTIFY_SENDER" |
+                         "SPOILAGE_ASSESSMENT" | "LOG_COMPLIANCE" | "POTENCY_TESTING",
+      "title":           "...",
+      "description":     "...",
+      "recipient_name":  "..." | null,
+      "recipient_email": "..." | null,         <- present on NOTIFY_* actions
+      "recipient_phone": "..." | null,
+      "email_subject":   "..." | null,         <- pre-written by Service D
+      "email_body":      "..." | null,         <- pre-written by Service D
+      "sms_body":        "..." | null,         <- ignored (SMS channel disabled)
+      "urgency":         "CRITICAL" | "HIGH",
+      "metadata":        { ... }
+    },
+    ...
+  ]
 }
 
-Note: Service D is not yet implemented. All payload fields have defaults so
-Service E can be tested by manually publishing to execute-actions before
-Service D is built. See the testing section of the setup guide.
+Execution logic per action:
+  - Has recipient_email + email_subject + email_body  → send email via Gmail SMTP
+  - No email fields                                   → log as acknowledged (no action needed)
+  - SMS channel is DISABLED — sms_body fields are ignored entirely
 
-Environment variables (set at gcloud run deploy time via --set-env-vars):
+After all actions are processed:
+  - Send voice notification (ElevenLabs TTS → GCS → Twilio call) to the primary phone
+    found in recovery_actions (first action with a non-null recipient_phone), or
+    the top-level contact_phone field.
+  - Write BigQuery audit log
+  - Mark Firestore pending_approvals/{document_id} as status="completed"
+
+Environment variables (--env-vars-file services/service_e/.env.yaml):
   GOOGLE_CLOUD_PROJECT
   FIRESTORE_DATABASE       (default: cargo-monitor)
-  ANTHROPIC_API_KEY
-  SENDGRID_API_KEY
-  SENDGRID_FROM_EMAIL      (default: alerts@agenticterps.com)
+  GMAIL_USER
+  GMAIL_APP_PASSWORD
   TWILIO_ACCOUNT_SID
   TWILIO_AUTH_TOKEN
   TWILIO_PHONE_NUMBER
   ELEVENLABS_API_KEY
-  ELEVENLABS_VOICE_ID      (default: 21m00Tcm4TlvDq8ikWAM = Rachel)
+  ELEVENLABS_VOICE_ID      (default: 21m00Tcm4TlvDq8ikWAM)
   VOICE_NOTES_BUCKET       (default: {PROJECT_ID}-voice-notes)
-
-Run locally with:
-  uvicorn main:app --reload --port 8080
 """
 
 from dotenv import load_dotenv
@@ -66,13 +77,12 @@ import json
 import logging
 import sys
 from datetime import datetime, timezone
-from typing import Optional
+from typing import Any, Optional
 
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
-import content_gen
 import notifications
 import compliance
 
@@ -92,16 +102,53 @@ logger = logging.getLogger("service_e")
 app = FastAPI(
     title="AgenticTerps — Service E: Execution Agent",
     description=(
-        "Receives approved risk events from execute-actions Pub/Sub topic, "
-        "generates notification content via Claude, and executes email, SMS, "
-        "and voice notifications to the responsible party."
+        "Receives approved recovery plans from Service D via execute-actions "
+        "Pub/Sub topic. Iterates over recovery_actions, sends emails where "
+        "pre-written content is provided, delivers a voice notification to the "
+        "primary contact, writes a BigQuery audit record, and marks the Firestore "
+        "pending_approvals document as completed."
     ),
-    version="1.0.0",
+    version="2.0.0",
 )
 
 # ---------------------------------------------------------------------------
 # Pydantic models
 # ---------------------------------------------------------------------------
+
+class RecoveryAction(BaseModel):
+    """A single step in the recovery plan produced by Service D."""
+    step:            int
+    action_type:     str
+    title:           str
+    description:     str
+    recipient_name:  Optional[str] = None
+    recipient_email: Optional[str] = None
+    recipient_phone: Optional[str] = None
+    email_subject:   Optional[str] = None
+    email_body:      Optional[str] = None
+    sms_body:        Optional[str] = None   # ignored — SMS channel disabled
+    urgency:         str = "CRITICAL"
+    metadata:        dict = {}
+
+class ExecutePayload(BaseModel):
+    """
+    Decoded execute-actions message from Service D.
+    Top-level identification fields are expected alongside the recovery_actions list.
+    All have defaults so the service degrades gracefully during testing.
+    """
+    # ── Identification ───────────────────────────────────────────────────────
+    drug_id:            str  = "unknown"
+    drug_name:          str  = ""
+    document_id:        str  = "unknown"   # Firestore pending_approvals doc ID
+    approval_id:        str  = "unknown"   # fallback if document_id absent
+    approved_by:        str  = "operator"
+    risk_level:         str  = "CRITICAL"
+    contact_phone:      str  = ""          # fallback for voice notification
+
+    # ── Service D content ────────────────────────────────────────────────────
+    agent_summary:      str  = ""
+    spoilage_assessment: str = ""
+    recovery_actions:   list[RecoveryAction] = []
 
 class PubSubMessage(BaseModel):
     data:        str
@@ -113,34 +160,34 @@ class PubSubEnvelope(BaseModel):
     message:      PubSubMessage
     subscription: Optional[str] = None
 
-class ExecutePayload(BaseModel):
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def _find_primary_phone(payload: ExecutePayload) -> str:
     """
-    Decoded execute-actions message. All fields have defaults because
-    Service D is not yet implemented — tests may send partial payloads.
+    Return the best phone number available for the voice notification.
+    Preference: first recovery_action with a non-null recipient_phone,
+    then the top-level contact_phone field.
     """
-    approval_id:                    str   = "unknown"
-    approved_by:                    str   = "operator"
-    approved_at:                    str   = ""
-    drug_id:                        str   = "unknown"
-    drug_name:                      str   = ""
-    manufacturer:                   str   = ""
-    cargo_category:                 str   = ""
-    risk_level:                     str   = "CRITICAL"
-    overall_assessment:             str   = ""
-    breaches:                       list  = []
-    compound_risk_note:             Optional[str] = None
-    recommended_actions:            list  = []
-    mitigation_plan:                str   = ""
-    spoilage_likelihood:            str   = ""
-    estimated_viable_units_percent: int   = 0
-    regulatory_flags:               list  = []
-    contact_email:                  str   = ""
-    contact_phone:                  str   = ""
-    telemetry:                      dict  = {}
-    thresholds:                     dict  = {}
-    iata_codes:                     list  = []
-    regulatory_framework:           str   = ""
-    special_instructions:           Optional[str] = None
+    for action in payload.recovery_actions:
+        if action.recipient_phone:
+            return action.recipient_phone
+    return payload.contact_phone
+
+
+def _build_voice_script(payload: ExecutePayload) -> str:
+    """
+    Build a short spoken voice script (≤25 words) for the ElevenLabs TTS call.
+    Derived from the payload's risk level and drug name — no Claude call needed.
+    """
+    drug  = payload.drug_name or payload.drug_id
+    level = payload.risk_level.capitalize()
+    return (
+        f"{level} pharmaceutical alert. Cold chain breach confirmed on {drug} shipment. "
+        f"Recovery plan is now being executed. Immediate action required."
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -158,15 +205,14 @@ async def execute_actions(envelope: PubSubEnvelope, request: Request):
     Pub/Sub push endpoint for the execute-actions topic.
 
     Must return HTTP 2xx to ACK the message. Non-2xx triggers redelivery.
-    All errors are caught and ACK'd (with logged details) to prevent
-    infinite redelivery of messages that cannot succeed (e.g. missing contacts).
+    All errors are caught and ACK'd to prevent infinite redelivery.
 
     Pipeline:
       1. Decode and validate the Pub/Sub message
-      2. Generate email + SMS + voice content via Claude (single call)
-      3. Execute all three notification channels independently
+      2. Execute each recovery_action (email where content is provided, log the rest)
+      3. Send voice notification to the primary contact phone
       4. Write audit record to BigQuery
-      5. Update Firestore approval status
+      5. Mark Firestore pending_approvals document as completed
       6. Return 200 ACK with execution summary
     """
     started_at = datetime.now(timezone.utc).isoformat()
@@ -180,94 +226,71 @@ async def execute_actions(envelope: PubSubEnvelope, request: Request):
         payload      = ExecutePayload(**payload_dict)
     except Exception as exc:
         logger.error("Failed to decode Pub/Sub execute-actions message: %s", exc)
-        # ACK malformed messages — retrying won't fix a bad payload
         return JSONResponse(
             status_code=200,
             content={"error": "bad_message", "detail": str(exc)},
         )
 
+    # Resolve document_id — prefer approval_id, fall back to document_id
+    doc_id = payload.approval_id if payload.approval_id != "unknown" else payload.document_id
+
     logger.info(
-        "Received execute-actions | approval_id=%s | drug_id=%s | "
-        "risk=%s | approved_by=%s",
-        payload.approval_id,
+        "Received execute-actions | drug_id=%s | doc_id=%s | risk=%s | "
+        "approved_by=%s | actions=%d",
         payload.drug_id,
+        doc_id,
         payload.risk_level,
         payload.approved_by,
+        len(payload.recovery_actions),
     )
 
-    payload_dict = payload.model_dump()
+    # ------------------------------------------------------------------
+    # 2. Execute each recovery action
+    # ------------------------------------------------------------------
+    action_results = notifications.execute_recovery_actions(payload.recovery_actions)
 
-    # ------------------------------------------------------------------
-    # 2. Generate notification content via Claude
-    # ------------------------------------------------------------------
-    try:
-        content = content_gen.generate_notification_content(payload_dict)
-    except Exception as exc:
-        logger.error(
-            "Content generation failed | drug_id=%s | error=%s",
-            payload.drug_id, exc,
-        )
-        # ACK the message — Claude failure shouldn't block the pipeline indefinitely.
-        # The BigQuery audit log will record the failure for traceability.
-        content = {
-            "email_subject": f"[{payload.risk_level}] Cold Chain Alert: {payload.drug_name or payload.drug_id}",
-            "email_body":    (
-                f"A {payload.risk_level} risk event has been approved for action.\n\n"
-                f"Drug: {payload.drug_name or payload.drug_id}\n"
-                f"Assessment: {payload.overall_assessment}\n\n"
-                f"Please review the monitoring dashboard immediately."
-            ),
-            "sms_text":     f"[{payload.risk_level}] Cold chain alert: {payload.drug_name or payload.drug_id}. Check dashboard.",
-            "voice_script": f"Urgent alert. Cold chain risk confirmed for {payload.drug_name or payload.drug_id}. Immediate action required.",
-        }
-        logger.warning(
-            "Using fallback notification content | drug_id=%s",
-            payload.drug_id,
-        )
+    email_count  = sum(1 for r in action_results if r.get("channel") == "email" and r.get("success"))
+    logged_count = sum(1 for r in action_results if r.get("channel") == "logged")
 
-    # ------------------------------------------------------------------
-    # 3. Execute all three notification channels independently
-    # ------------------------------------------------------------------
-    notification_results = notifications.execute_all_channels(
-        payload=payload_dict,
-        content=content,
+    logger.info(
+        "Recovery actions complete | emails_sent=%d | logged=%d | total=%d",
+        email_count, logged_count, len(action_results),
     )
+
+    # ------------------------------------------------------------------
+    # 3. Send voice notification to the primary contact
+    # ------------------------------------------------------------------
+    primary_phone = _find_primary_phone(payload)
+    voice_script  = _build_voice_script(payload)
+    voice_result  = notifications.send_voice_notification(primary_phone, voice_script)
 
     # ------------------------------------------------------------------
     # 4. Write audit record to BigQuery
     # ------------------------------------------------------------------
     audit_result = compliance.write_audit_log(
-        payload=payload_dict,
-        notification_results=notification_results,
+        payload=payload.model_dump(),
+        action_results=action_results,
+        voice_result=voice_result,
     )
 
     # ------------------------------------------------------------------
-    # 5. Update Firestore approval status
+    # 5. Mark Firestore document as completed
     # ------------------------------------------------------------------
-    firestore_result = compliance.update_approval_status(
-        approval_id=payload.approval_id,
-        notification_results=notification_results,
+    firestore_result = compliance.mark_completed(
+        document_id=doc_id,
+        action_results=action_results,
     )
 
     # ------------------------------------------------------------------
-    # 6. Build and return execution summary
+    # 6. Return execution summary
     # ------------------------------------------------------------------
-    channels_succeeded = [
-        ch for ch, res in notification_results.items()
-        if res.get("success")
-    ]
-    channels_failed = [
-        ch for ch, res in notification_results.items()
-        if not res.get("success")
-    ]
-
     logger.info(
-        "Execution complete | drug_id=%s | approval_id=%s | "
-        "succeeded=%s | failed=%s | audit=%s | firestore=%s",
+        "Execution complete | drug_id=%s | doc_id=%s | "
+        "emails=%d | voice=%s | audit=%s | firestore=%s",
         payload.drug_id,
-        payload.approval_id,
-        channels_succeeded,
-        channels_failed,
+        doc_id,
+        email_count,
+        voice_result.get("success"),
         audit_result.get("success"),
         firestore_result.get("success"),
     )
@@ -275,15 +298,17 @@ async def execute_actions(envelope: PubSubEnvelope, request: Request):
     return JSONResponse(
         status_code=200,
         content={
-            "drug_id":              payload.drug_id,
-            "approval_id":          payload.approval_id,
-            "risk_level":           payload.risk_level,
-            "channels_succeeded":   channels_succeeded,
-            "channels_failed":      channels_failed,
-            "audit_log_written":    audit_result.get("success", False),
-            "firestore_updated":    firestore_result.get("success", False),
-            "started_at":           started_at,
-            "completed_at":         datetime.now(timezone.utc).isoformat(),
+            "drug_id":            payload.drug_id,
+            "document_id":        doc_id,
+            "risk_level":         payload.risk_level,
+            "actions_total":      len(action_results),
+            "emails_sent":        email_count,
+            "actions_logged":     logged_count,
+            "voice_notification": voice_result,
+            "audit_log_written":  audit_result.get("success", False),
+            "firestore_completed": firestore_result.get("success", False),
+            "started_at":         started_at,
+            "completed_at":       datetime.now(timezone.utc).isoformat(),
         },
     )
 
