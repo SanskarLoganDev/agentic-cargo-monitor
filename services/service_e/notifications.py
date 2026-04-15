@@ -2,40 +2,49 @@
 Service E — Execution Agent
 Notification delivery module.
 
-Three independent notification channels — each can succeed or fail without
-blocking the others. Results are collected and returned to main.py for
-inclusion in the BigQuery audit log.
+Two active channels:
+  1. Email  — Gmail SMTP via smtplib (stdlib — no dependency needed)
+  2. Voice  — ElevenLabs TTS → GCS (public MP3) → Twilio outbound call
 
-Channels:
-  1. Email  — SendGrid REST API (free tier: 100 emails/day)
-  2. SMS    — Twilio Programmable SMS (trial: pre-verified numbers only)
-  3. Voice  — ElevenLabs TTS → GCS (public MP3) → Twilio outbound call
+SMS channel is DISABLED. The sms_body field on recovery_actions is ignored entirely.
 
-All GCP/external clients are initialised at module level for warm instance reuse.
+Execution model:
+  execute_recovery_actions(actions) iterates over the list from Service D.
+  For each action:
+    - Has recipient_email + email_subject + email_body → send email
+    - Otherwise                                        → log as acknowledged
+
+  send_voice_notification(phone, script) is called once after all actions,
+  independently of the per-action loop.
+
+Note on client initialisation:
+  GCS and Twilio clients are module-level (reused across warm instances).
+  Gmail SMTP connection is opened per-send — SMTP connections are stateful
+  and time out during Cloud Run idle periods.
 
 Environment variables required:
   GOOGLE_CLOUD_PROJECT
-  VOICE_NOTES_BUCKET       — GCS bucket for temporary MP3 storage
-  SENDGRID_API_KEY
-  SENDGRID_FROM_EMAIL      — verified sender address in SendGrid
+  VOICE_NOTES_BUCKET
+  GMAIL_USER
+  GMAIL_APP_PASSWORD
   TWILIO_ACCOUNT_SID
   TWILIO_AUTH_TOKEN
-  TWILIO_PHONE_NUMBER      — your provisioned Twilio number (E.164 format)
+  TWILIO_PHONE_NUMBER
   ELEVENLABS_API_KEY
-  ELEVENLABS_VOICE_ID      — voice ID from ElevenLabs library
-                             (default: 21m00Tcm4TlvDq8ikWAM = Rachel)
+  ELEVENLABS_VOICE_ID      (default: 21m00Tcm4TlvDq8ikWAM = Rachel)
 """
 
 import logging
 import os
+import smtplib
 import uuid
 from datetime import datetime, timezone
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
 from typing import Optional
 
 import requests
-import sendgrid
 from google.cloud import storage
-from sendgrid.helpers.mail import Mail
 from twilio.rest import Client as TwilioClient
 from twilio.twiml.voice_response import VoiceResponse
 
@@ -44,302 +53,242 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------------
-PROJECT_ID             = os.environ["GOOGLE_CLOUD_PROJECT"]
-VOICE_NOTES_BUCKET     = os.environ.get("VOICE_NOTES_BUCKET", f"{PROJECT_ID}-voice-notes")
+PROJECT_ID          = os.environ["GOOGLE_CLOUD_PROJECT"]
+VOICE_NOTES_BUCKET  = os.environ.get("VOICE_NOTES_BUCKET", f"{PROJECT_ID}-voice-notes")
 
-SENDGRID_API_KEY       = os.environ["SENDGRID_API_KEY"]
-SENDGRID_FROM_EMAIL    = os.environ.get("SENDGRID_FROM_EMAIL", "alerts@agenticterps.com")
+GMAIL_USER          = os.environ["GMAIL_USER"]
+GMAIL_APP_PASSWORD  = os.environ["GMAIL_APP_PASSWORD"]
 
-TWILIO_ACCOUNT_SID     = os.environ["TWILIO_ACCOUNT_SID"]
-TWILIO_AUTH_TOKEN      = os.environ["TWILIO_AUTH_TOKEN"]
-TWILIO_PHONE_NUMBER    = os.environ["TWILIO_PHONE_NUMBER"]
+TWILIO_ACCOUNT_SID  = os.environ["TWILIO_ACCOUNT_SID"]
+TWILIO_AUTH_TOKEN   = os.environ["TWILIO_AUTH_TOKEN"]
+TWILIO_PHONE_NUMBER = os.environ["TWILIO_PHONE_NUMBER"]
 
-ELEVENLABS_API_KEY     = os.environ["ELEVENLABS_API_KEY"]
-ELEVENLABS_VOICE_ID    = os.environ.get("ELEVENLABS_VOICE_ID", "21m00Tcm4TlvDq8ikWAM")
-ELEVENLABS_TTS_URL     = f"https://api.elevenlabs.io/v1/text-to-speech/{ELEVENLABS_VOICE_ID}"
+ELEVENLABS_API_KEY  = os.environ["ELEVENLABS_API_KEY"]
+ELEVENLABS_VOICE_ID = os.environ.get("ELEVENLABS_VOICE_ID", "21m00Tcm4TlvDq8ikWAM")
+ELEVENLABS_TTS_URL  = f"https://api.elevenlabs.io/v1/text-to-speech/{ELEVENLABS_VOICE_ID}"
 
 # ---------------------------------------------------------------------------
 # Module-level clients — reused across warm Cloud Run instances
+# Gmail SMTP is NOT module-level — see send_email() for the reason.
 # ---------------------------------------------------------------------------
 _gcs_client    = storage.Client(project=PROJECT_ID)
-_sg_client     = sendgrid.SendGridAPIClient(api_key=SENDGRID_API_KEY)
 _twilio_client = TwilioClient(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
 
 
 # ---------------------------------------------------------------------------
-# Channel 1 — Email via SendGrid
+# Email via Gmail SMTP
 # ---------------------------------------------------------------------------
 
-def send_email(
-    to_email:  str,
-    subject:   str,
-    body:      str,
-) -> dict:
+def send_email(to_email: str, subject: str, body: str) -> dict:
     """
-    Send a plain-text email via SendGrid.
+    Send a plain-text email via Gmail SMTP using an App Password.
+
+    Opens a fresh SMTP connection per call — connections time out during
+    Cloud Run idle periods so a persistent module-level connection is unsafe.
 
     Returns:
-        {"success": True, "status_code": 202} on success.
+        {"success": True, "to": str, "subject": str} on success.
         {"success": False, "error": str} on failure.
     """
     if not to_email:
-        return {"success": False, "error": "No contact_email in payload"}
+        return {"success": False, "error": "recipient email is empty"}
 
     try:
-        message = Mail(
-            from_email=SENDGRID_FROM_EMAIL,
-            to_emails=to_email,
-            subject=subject,
-            plain_text_content=body,
-        )
-        response = _sg_client.send(message)
+        msg = MIMEMultipart()
+        msg["From"]    = GMAIL_USER
+        msg["To"]      = to_email
+        msg["Subject"] = subject
+        msg.attach(MIMEText(body, "plain"))
+
+        with smtplib.SMTP("smtp.gmail.com", 587) as server:
+            server.starttls()
+            server.login(GMAIL_USER, GMAIL_APP_PASSWORD)
+            server.sendmail(GMAIL_USER, to_email, msg.as_string())
+
         logger.info(
-            "Email sent | to=%s | status=%d",
-            to_email, response.status_code,
+            "Email sent | to=%s | subject='%s'",
+            to_email, subject[:60],
         )
-        return {"success": True, "status_code": response.status_code}
+        return {"success": True, "to": to_email, "subject": subject}
+
+    except smtplib.SMTPAuthenticationError as exc:
+        logger.error(
+            "Gmail SMTP auth failed | user=%s | "
+            "Check GMAIL_APP_PASSWORD is a valid App Password with 2FA enabled | %s",
+            GMAIL_USER, exc,
+        )
+        return {"success": False, "error": f"SMTP auth failed: {exc}"}
 
     except Exception as exc:
-        logger.error("SendGrid email failed | to=%s | error=%s", to_email, exc)
+        logger.error("Gmail SMTP failed | to=%s | error=%s", to_email, exc)
         return {"success": False, "error": str(exc)}
 
 
 # ---------------------------------------------------------------------------
-# Channel 2 — SMS via Twilio
+# Recovery action executor
 # ---------------------------------------------------------------------------
 
-def send_sms(to_phone: str, body: str) -> dict:
+def execute_recovery_actions(actions: list) -> list:
     """
-    Send an SMS via Twilio Programmable SMS.
+    Iterate over the recovery_actions list from Service D and execute each step.
 
-    On Twilio trial accounts, messages can only be sent to pre-verified numbers.
-    The contact_phone values in the Firestore shipment documents must be verified
-    in the Twilio Console before this will succeed.
+    For actions that have recipient_email + email_subject + email_body:
+        Send the pre-written email via Gmail SMTP.
+
+    For all other actions (QUARANTINE, CONTACT_CARRIER, SPOILAGE_ASSESSMENT,
+    LOG_COMPLIANCE, POTENCY_TESTING — no email fields):
+        Log the action as acknowledged. These are operational/physical steps
+        that a human must carry out; Service E records that the instruction
+        was dispatched.
+
+    Args:
+        actions: List of dicts or RecoveryAction-like objects from the payload.
 
     Returns:
-        {"success": True, "message_sid": str} on success.
-        {"success": False, "error": str} on failure.
+        List of result dicts, one per action, in step order.
+        Each result:
+          {"step": int, "action_type": str, "title": str,
+           "channel": "email" | "logged",
+           "success": bool, ...channel-specific fields}
     """
-    if not to_phone:
-        return {"success": False, "error": "No contact_phone in payload"}
+    results = []
 
-    try:
-        message = _twilio_client.messages.create(
-            to=to_phone,
-            from_=TWILIO_PHONE_NUMBER,
-            body=body,
-        )
-        logger.info(
-            "SMS sent | to=%s | sid=%s | status=%s",
-            to_phone, message.sid, message.status,
-        )
-        return {"success": True, "message_sid": message.sid}
+    for action in actions:
+        # Support both Pydantic model objects and plain dicts
+        if hasattr(action, "model_dump"):
+            a = action.model_dump()
+        elif hasattr(action, "__dict__"):
+            a = vars(action)
+        else:
+            a = action
 
-    except Exception as exc:
-        logger.error("Twilio SMS failed | to=%s | error=%s", to_phone, exc)
-        return {"success": False, "error": str(exc)}
+        step        = a.get("step", 0)
+        action_type = a.get("action_type", "UNKNOWN")
+        title       = a.get("title", "")
+        email       = a.get("recipient_email")
+        subject     = a.get("email_subject")
+        body        = a.get("email_body")
+
+        has_email_content = bool(email and subject and body)
+
+        if has_email_content:
+            # Send the pre-written email from Service D
+            logger.info(
+                "Executing email action | step=%d | type=%s | to=%s",
+                step, action_type, email,
+            )
+            result = send_email(to_email=email, subject=subject, body=body)
+            result.update({"step": step, "action_type": action_type,
+                           "title": title, "channel": "email"})
+        else:
+            # Log as acknowledged — physical/operational step for human execution
+            logger.info(
+                "Acknowledging action (no email required) | step=%d | type=%s | title=%s",
+                step, action_type, title,
+            )
+            result = {
+                "step":        step,
+                "action_type": action_type,
+                "title":       title,
+                "channel":     "logged",
+                "success":     True,
+            }
+
+        results.append(result)
+
+    return results
 
 
 # ---------------------------------------------------------------------------
-# Channel 3a — Voice note generation via ElevenLabs TTS
+# Voice notification (ElevenLabs TTS → GCS → Twilio outbound call)
 # ---------------------------------------------------------------------------
 
-def generate_voice_note(script: str) -> Optional[bytes]:
-    """
-    Call the ElevenLabs TTS API to convert the voice_script to MP3 audio bytes.
-
-    Uses eleven_multilingual_v2 model — available on the free tier.
-
-    Returns:
-        Raw MP3 bytes on success, None on failure.
-    """
+def _generate_voice_note(script: str) -> Optional[bytes]:
+    """Call ElevenLabs TTS and return raw MP3 bytes."""
     try:
-        headers = {
-            "xi-api-key":   ELEVENLABS_API_KEY,
-            "Content-Type": "application/json",
-            "Accept":       "audio/mpeg",
-        }
-        body = {
-            "text":       script,
-            "model_id":   "eleven_multilingual_v2",
-            "voice_settings": {
-                "stability":        0.5,
-                "similarity_boost": 0.75,
-            },
-        }
         response = requests.post(
             ELEVENLABS_TTS_URL,
-            json=body,
-            headers=headers,
+            json={
+                "text":     script,
+                "model_id": "eleven_multilingual_v2",
+                "voice_settings": {"stability": 0.5, "similarity_boost": 0.75},
+            },
+            headers={
+                "xi-api-key":   ELEVENLABS_API_KEY,
+                "Content-Type": "application/json",
+                "Accept":       "audio/mpeg",
+            },
             timeout=30,
         )
         response.raise_for_status()
         logger.info(
-            "ElevenLabs TTS generated | voice_id=%s | audio_bytes=%d",
+            "ElevenLabs TTS generated | voice_id=%s | bytes=%d",
             ELEVENLABS_VOICE_ID, len(response.content),
         )
         return response.content
-
     except Exception as exc:
         logger.error("ElevenLabs TTS failed | error=%s", exc)
         return None
 
 
-# ---------------------------------------------------------------------------
-# Channel 3b — Upload MP3 to GCS (public URL)
-# ---------------------------------------------------------------------------
-
-def upload_voice_note_to_gcs(
-    audio_bytes: bytes,
-    drug_id:     str,
-    approval_id: str,
-) -> Optional[str]:
-    """
-    Upload the MP3 audio bytes to the voice-notes GCS bucket.
-
-    The bucket is configured with public-read IAM so the resulting URL is
-    immediately accessible by Twilio without signed URL complexity.
-
-    Returns:
-        Public GCS URL string on success, None on failure.
-    """
-    timestamp  = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-    blob_name  = f"voice-note-{drug_id}-{approval_id}-{timestamp}.mp3"
-
+def _upload_to_gcs(audio_bytes: bytes, filename: str) -> Optional[str]:
+    """Upload MP3 to the public voice-notes bucket and return the public URL."""
     try:
         bucket = _gcs_client.bucket(VOICE_NOTES_BUCKET)
-        blob   = bucket.blob(blob_name)
+        blob   = bucket.blob(filename)
         blob.upload_from_string(audio_bytes, content_type="audio/mpeg")
-
-        public_url = f"https://storage.googleapis.com/{VOICE_NOTES_BUCKET}/{blob_name}"
-        logger.info(
-            "Voice note uploaded to GCS | bucket=%s | blob=%s | url=%s",
-            VOICE_NOTES_BUCKET, blob_name, public_url,
-        )
-        return public_url
-
+        url = f"https://storage.googleapis.com/{VOICE_NOTES_BUCKET}/{filename}"
+        logger.info("Voice note uploaded | bucket=%s | blob=%s", VOICE_NOTES_BUCKET, filename)
+        return url
     except Exception as exc:
-        logger.error("GCS voice note upload failed | blob=%s | error=%s", blob_name, exc)
+        logger.error("GCS upload failed | filename=%s | error=%s", filename, exc)
         return None
 
 
-# ---------------------------------------------------------------------------
-# Channel 3c — Outbound voice call via Twilio
-# ---------------------------------------------------------------------------
-
-def make_voice_call(to_phone: str, audio_url: str) -> dict:
+def send_voice_notification(to_phone: str, script: str) -> dict:
     """
-    Place an outbound Twilio voice call that plays the voice note MP3.
+    Generate a voice note via ElevenLabs TTS, upload to GCS, and place a
+    Twilio outbound call to to_phone that plays the MP3.
 
-    Uses inline TwiML with <Play> verb — no separate TwiML endpoint needed.
-    On Twilio trial accounts, calls can only be made to pre-verified numbers.
+    Args:
+        to_phone: E.164 phone number of the recipient.
+        script:   Short spoken text (≤25 words) for the voice note.
 
     Returns:
-        {"success": True, "call_sid": str} on success.
-        {"success": False, "error": str} on failure.
+        {"success": True, "call_sid": str, "gcs_url": str} on success.
+        {"success": False, "error": str} on any failure.
     """
     if not to_phone:
-        return {"success": False, "error": "No contact_phone in payload"}
+        return {"success": False, "error": "No phone number available for voice notification"}
 
+    # Step 1 — Generate audio
+    audio_bytes = _generate_voice_note(script)
+    if audio_bytes is None:
+        return {"success": False, "error": "ElevenLabs TTS generation failed"}
+
+    # Step 2 — Upload to GCS
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    filename  = f"voice-note-{uuid.uuid4().hex[:8]}-{timestamp}.mp3"
+    gcs_url   = _upload_to_gcs(audio_bytes, filename)
+    if gcs_url is None:
+        return {"success": False, "error": "GCS upload failed"}
+
+    # Step 3 — Place Twilio call
     try:
-        twiml_response = VoiceResponse()
-        twiml_response.play(audio_url)
+        twiml = VoiceResponse()
+        twiml.play(gcs_url)
 
         call = _twilio_client.calls.create(
             to=to_phone,
             from_=TWILIO_PHONE_NUMBER,
-            twiml=str(twiml_response),
+            twiml=str(twiml),
         )
         logger.info(
             "Voice call placed | to=%s | sid=%s | status=%s",
             to_phone, call.sid, call.status,
         )
-        return {"success": True, "call_sid": call.sid}
+        return {"success": True, "call_sid": call.sid, "gcs_url": gcs_url}
 
     except Exception as exc:
         logger.error("Twilio voice call failed | to=%s | error=%s", to_phone, exc)
-        return {"success": False, "error": str(exc)}
-
-
-# ---------------------------------------------------------------------------
-# Orchestrator — run all three channels and return collected results
-# ---------------------------------------------------------------------------
-
-def execute_all_channels(
-    payload:       dict,
-    content:       dict,
-) -> dict:
-    """
-    Execute all three notification channels independently.
-    A failure in one channel does not prevent the others from running.
-
-    Args:
-        payload: The decoded execute-actions message dict.
-        content: The generated notification content dict from content_gen.py.
-
-    Returns:
-        Dict with results for each channel:
-        {
-            "email":       {"success": bool, ...},
-            "sms":         {"success": bool, ...},
-            "voice_call":  {"success": bool, ...},
-        }
-    """
-    contact_email = payload.get("contact_email", "")
-    contact_phone = payload.get("contact_phone", "")
-    drug_id       = payload.get("drug_id", "unknown")
-    approval_id   = payload.get("approval_id", str(uuid.uuid4()))
-
-    results: dict = {}
-
-    # ── Channel 1: Email ────────────────────────────────────────────────
-    logger.info("Executing channel: email | to=%s", contact_email)
-    results["email"] = send_email(
-        to_email=contact_email,
-        subject=content["email_subject"],
-        body=content["email_body"],
-    )
-
-    # ── Channel 2: SMS ──────────────────────────────────────────────────
-    logger.info("Executing channel: SMS | to=%s", contact_phone)
-    results["sms"] = send_sms(
-        to_phone=contact_phone,
-        body=content["sms_text"],
-    )
-
-    # ── Channel 3: Voice note ───────────────────────────────────────────
-    logger.info("Executing channel: voice | to=%s", contact_phone)
-
-    audio_bytes = generate_voice_note(content["voice_script"])
-
-    if audio_bytes is None:
-        results["voice_call"] = {
-            "success": False,
-            "error":   "ElevenLabs TTS generation failed — voice call skipped",
-        }
-    else:
-        gcs_url = upload_voice_note_to_gcs(audio_bytes, drug_id, approval_id)
-        if gcs_url is None:
-            results["voice_call"] = {
-                "success": False,
-                "error":   "GCS upload failed — voice call skipped",
-            }
-        else:
-            results["voice_call"] = make_voice_call(
-                to_phone=contact_phone,
-                audio_url=gcs_url,
-            )
-            results["voice_call"]["gcs_url"] = gcs_url
-
-    # ── Summary ─────────────────────────────────────────────────────────
-    successes = sum(1 for r in results.values() if r.get("success"))
-    logger.info(
-        "Notification channels complete | %d/3 succeeded | "
-        "email=%s | sms=%s | voice=%s",
-        successes,
-        results["email"].get("success"),
-        results["sms"].get("success"),
-        results["voice_call"].get("success"),
-    )
-
-    return results
+        return {"success": False, "error": str(exc), "gcs_url": gcs_url}
