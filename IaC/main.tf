@@ -48,7 +48,7 @@ resource "google_storage_bucket" "pdf_manifests" {
 
   lifecycle_rule {
     condition { age = 90 }
-    action    { type = "Delete" }
+    action { type = "Delete" }
   }
 
   cors {
@@ -76,7 +76,7 @@ resource "google_storage_bucket" "voice_notes" {
 
   lifecycle_rule {
     condition { age = 1 }
-    action    { type = "Delete" }
+    action { type = "Delete" }
   }
 
   depends_on = [google_project_service.apis]
@@ -213,17 +213,17 @@ resource "google_service_account" "service_d" {
 
 # Read shipment metadata + write pending-approvals + approved-actions
 resource "google_project_iam_member" "service_d_firestore" {
-  project = var.project_id
-  role    = "roles/datastore.user"
-  member  = "serviceAccount:${google_service_account.service_d.email}"
+  project    = var.project_id
+  role       = "roles/datastore.user"
+  member     = "serviceAccount:${google_service_account.service_d.email}"
   depends_on = [google_service_account.service_d]
 }
 
 # Allow Pub/Sub to invoke this Cloud Run service (push subscription auth)
 resource "google_project_iam_member" "service_d_pubsub_invoker" {
-  project = var.project_id
-  role    = "roles/run.invoker"
-  member  = "serviceAccount:${google_service_account.service_d.email}"
+  project    = var.project_id
+  role       = "roles/run.invoker"
+  member     = "serviceAccount:${google_service_account.service_d.email}"
   depends_on = [google_service_account.service_d]
 }
 
@@ -306,12 +306,12 @@ resource "google_storage_bucket_iam_member" "service_e_voice_notes_writer" {
 # a different name.
 # ─────────────────────────────────────────────
 resource "google_firestore_database" "main" {
-  project                     = var.project_id
-  name                        = "cargo-monitor"
-  location_id                 = var.firestore_location
-  type                        = "FIRESTORE_NATIVE"
-  deletion_policy             = "DELETE"
-  delete_protection_state     = "DELETE_PROTECTION_DISABLED"
+  project                 = var.project_id
+  name                    = "cargo-monitor"
+  location_id             = var.firestore_location
+  type                    = "FIRESTORE_NATIVE"
+  deletion_policy         = "DELETE"
+  delete_protection_state = "DELETE_PROTECTION_DISABLED"
 
   depends_on = [google_project_service.apis]
 }
@@ -438,10 +438,40 @@ resource "google_bigquery_table" "audit_log" {
   deletion_protection = false
 
   schema = jsonencode([
-    { name = "shipment_id", type = "STRING",    mode = "REQUIRED" },
-    { name = "event_type",  type = "STRING",    mode = "REQUIRED" },
-    { name = "actor",       type = "STRING",    mode = "NULLABLE" },
-    { name = "details",     type = "JSON",      mode = "NULLABLE" },
-    { name = "timestamp",   type = "TIMESTAMP", mode = "REQUIRED" },
+    { name = "shipment_id", type = "STRING", mode = "REQUIRED" },
+    { name = "event_type", type = "STRING", mode = "REQUIRED" },
+    { name = "actor", type = "STRING", mode = "NULLABLE" },
+    { name = "details", type = "JSON", mode = "NULLABLE" },
+    { name = "timestamp", type = "TIMESTAMP", mode = "REQUIRED" },
   ])
+}
+
+# Frontend Node/Express app identity
+# Use this service account when deploying the frontend so it can:
+# - read and update Firestore documents used by the dashboard/approval flow
+# - publish approved actions to the execute-actions Pub/Sub topic
+resource "google_service_account" "frontend" {
+  account_id   = "frontend-ui"
+  display_name = "Frontend UI"
+  description  = "Used by the frontend app to read Firestore and publish approved actions to Pub/Sub."
+  project      = var.project_id
+
+  depends_on = [google_project_service.apis]
+}
+
+resource "google_project_iam_member" "frontend_firestore" {
+  project = var.project_id
+  role    = "roles/datastore.user"
+  member  = "serviceAccount:${google_service_account.frontend.email}"
+
+  depends_on = [google_service_account.frontend]
+}
+
+resource "google_pubsub_topic_iam_member" "frontend_execute_actions_publisher" {
+  project = var.project_id
+  topic   = google_pubsub_topic.execute_actions.name
+  role    = "roles/pubsub.publisher"
+  member  = "serviceAccount:${google_service_account.frontend.email}"
+
+  depends_on = [google_service_account.frontend, google_pubsub_topic.execute_actions]
 }
