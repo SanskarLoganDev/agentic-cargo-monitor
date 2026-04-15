@@ -5,12 +5,27 @@
   const shockDisplay = document.querySelector("[data-shock-display]");
   const humidityRange = document.querySelector("[data-humidity-range]");
   const humidityBubble = document.querySelector("[data-humidity-bubble]");
+  const pendingApprovalsCountEl = document.querySelector("[data-pending-approvals-count]");
   const flightStatus = document.querySelector("[data-flight-status]");
   const saveUpdatesBtn = document.querySelector("[data-save-updates]");
   const approveBtn = document.getElementById("approveBtn");
   const escalateBtn = document.getElementById("escalateBtn");
   const approvalStatus = document.getElementById("approvalStatus");
   const pendingUpdates = {};
+
+  async function refreshPendingApprovalsCount() {
+    if (!pendingApprovalsCountEl) return;
+
+    try {
+      const response = await fetch("/api/pending-approvals/count", { cache: "no-store" });
+      if (!response.ok) throw new Error("Count fetch failed");
+
+      const result = await response.json();
+      pendingApprovalsCountEl.textContent = Number.isFinite(result?.count) ? String(result.count) : "0";
+    } catch {
+      // Keep the currently displayed value if polling fails.
+    }
+  }
 
   function markDirty(field, value) {
     pendingUpdates[field] = value;
@@ -207,6 +222,11 @@
         if (approvalStatus) approvalStatus.textContent = "Approval failed. Please retry.";
       }
     });
+  }
+
+  if (pendingApprovalsCountEl) {
+    refreshPendingApprovalsCount();
+    setInterval(refreshPendingApprovalsCount, 5000);
   }
 
   if (escalateBtn) {
