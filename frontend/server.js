@@ -4,18 +4,23 @@ const multer = require("multer");
 
 const admin = require("firebase-admin");
 
+const PROJECT_ID = "project-5b45a270-c7ca-42fd-9f6";
+const FIRESTORE_DATABASE_ID = "cargo-monitor";
+const EXECUTE_ACTIONS_TOPIC = "execute-actions";
+const FRONTEND_APPROVED_BY = "frontend-operator";
+
+const appCredential = admin.credential.applicationDefault();
+
 admin.initializeApp({
-  credential: admin.credential.applicationDefault(),
-  projectId: "project-5b45a270-c7ca-42fd-9f6"
+  credential: appCredential,
+  projectId: PROJECT_ID
 });
 
 const db = admin.firestore();
-db.settings({ databaseId: "cargo-monitor" });
+db.settings({ databaseId: FIRESTORE_DATABASE_ID });
 
 const app = express();
 const upload = multer({ dest: "uploads/" });
-
-const PUBSUB_EXECUTE_URL = "https://service-e-execution-446629917893.us-central1.run.app/pubsub/execute";
 
 app.set("view engine", "ejs");
 app.set("views", path.join(__dirname, "views"));
@@ -67,6 +72,15 @@ async function getPendingApprovals() {
 
 async function getApprovedActions() {
   return readCollectionFallback(["approved-actions", "approved actions", "approved_actions"]);
+}
+
+function isExactPendingStatus(status) {
+  return normalizeStatus(status) === "pending";
+}
+
+async function getApprovedActionsPending() {
+  const approvedActions = await getApprovedActions();
+  return approvedActions.filter((item) => isExactPendingStatus(item?.status));
 }
 
 function normalizeStatus(status) {
@@ -266,11 +280,8 @@ function getActionNeededMap(shipments, unresolvedItems) {
 }
 
 async function getPendingApprovalsCount() {
-  const [pendingApprovals, approvedActions] = await Promise.all([
-    getPendingApprovals(),
-    getApprovedActions()
-  ]);
-  return buildUnresolvedApprovals(pendingApprovals, approvedActions).length;
+  const approvedActionsPending = await getApprovedActionsPending();
+  return approvedActionsPending.length;
 }
 
 async function getCurrentActionableApprovalForMedicine(medicineKey) {
@@ -293,6 +304,50 @@ async function getCurrentActionableApprovalForMedicine(medicineKey) {
   };
 }
 
+async function getAccessToken() {
+  const token = await appCredential.getAccessToken();
+
+  if (typeof token === "string") {
+    return token;
+  }
+
+  if (token?.access_token) {
+    return token.access_token;
+  }
+
+  throw new Error("Unable to acquire Google access token for Pub/Sub publish.");
+}
+
+async function publishExecuteActionMessage(payload) {
+  const accessToken = await getAccessToken();
+  const publishUrl = `https://pubsub.googleapis.com/v1/projects/${PROJECT_ID}/topics/${EXECUTE_ACTIONS_TOPIC}:publish`;
+  const messageData = Buffer.from(JSON.stringify(payload), "utf8").toString("base64");
+
+  const response = await fetch(publishUrl, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${accessToken}`,
+      "Content-Type": "application/json"
+    },
+    body: JSON.stringify({
+      messages: [{ data: messageData }]
+    })
+  });
+
+  if (!response.ok) {
+    let errorText = "";
+    try {
+      errorText = await response.text();
+    } catch {
+      errorText = "";
+    }
+
+    throw new Error(`Pub/Sub publish failed (${response.status}): ${errorText || "empty body"}`);
+  }
+
+  return response.json();
+}
+
 // TEMP TEST ROUTE - delete after confirming Firestore works
 app.get("/test-firestore", async (req, res) => {
   try {
@@ -310,10 +365,11 @@ app.get("/test-firestore", async (req, res) => {
 
 app.get("/", async (req, res) => {
   try {
-    const [shipments, pendingApprovals, approvedActions] = await Promise.all([
+    const [shipments, pendingApprovals, approvedActions, pendingApprovalsCount] = await Promise.all([
       getShipments(),
       getPendingApprovals(),
-      getApprovedActions()
+      getApprovedActions(),
+      getPendingApprovalsCount()
     ]);
 
     const unresolvedApprovals = buildUnresolvedApprovals(pendingApprovals, approvedActions);
@@ -322,7 +378,7 @@ app.get("/", async (req, res) => {
     res.render("dashboard", {
       medicines: shipments,
       activeShipmentsCount: shipments.length,
-      pendingApprovalsCount: unresolvedApprovals.length,
+      pendingApprovalsCount,
       pendingApprovalsLabel: null,
       actionNeededByMedicine,
       showUpload: true,
@@ -387,13 +443,8 @@ app.get("/metadata/:medicineKey", async (req, res) => {
 
 app.get("/api/pending-approvals/count", async (req, res) => {
   try {
-    const [pendingApprovals, approvedActions] = await Promise.all([
-      getPendingApprovals(),
-      getApprovedActions()
-    ]);
-
-    const unresolved = buildUnresolvedApprovals(pendingApprovals, approvedActions);
-    res.json({ count: unresolved.length, items: unresolved });
+    const pendingApprovedActions = await getApprovedActionsPending();
+    res.json({ count: pendingApprovedActions.length, items: pendingApprovedActions });
   } catch {
     res.json({ count: 0, items: [] });
   }
@@ -430,45 +481,37 @@ async function handleApproveAction(req, res) {
       });
     }
 
-    const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(), 15000);
-
-    let pubsubResponse;
     const fullPendingApprovalDoc = actionableApproval;
+    const approvedAt = new Date().toISOString();
+    const publishPayload = {
+      ...fullPendingApprovalDoc,
+      document_id: fullPendingApprovalDoc.id || approvalId,
+      approval_id: fullPendingApprovalDoc.approval_id || approvalId,
+      approved_at: approvedAt,
+      approved_by: FRONTEND_APPROVED_BY
+    };
+
     try {
-      const pubsubBody = {
-        message: {
-          data: JSON.stringify(fullPendingApprovalDoc)
-        }
-      };
-
-      pubsubResponse = await fetch(PUBSUB_EXECUTE_URL, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(pubsubBody),
-        signal: controller.signal
-      });
-    } finally {
-      clearTimeout(timeoutId);
-    }
-
-    if (!pubsubResponse.ok) {
-      let errorText = "";
-      try {
-        errorText = await pubsubResponse.text();
-      } catch {
-        errorText = "";
-      }
-      console.error("Pub/Sub execute failed:", {
-        status: pubsubResponse.status,
-        body: errorText || "(empty body)"
-      });
+      await publishExecuteActionMessage(publishPayload);
+      await Promise.all([
+        db.collection("pending-approvals").doc(approvalId).set({
+          status: "approved",
+          approved_at: approvedAt,
+          approved_by: FRONTEND_APPROVED_BY
+        }, { merge: true }),
+        db.collection("approved-actions").doc(approvalId).set({
+          ...publishPayload,
+          status: "approved"
+        }, { merge: true })
+      ]);
+    } catch (err) {
+      console.error("Pub/Sub execute publish failed:", err);
       return res.status(502).json({ ok: false, error: "pubsub_failed" });
     }
 
     return res.json({
       ok: true,
-      approval_id: fullPendingApprovalDoc.approval_id || approvalId
+      approval_id: publishPayload.approval_id || approvalId
     });
   } catch (err) {
     console.error("Approve action error:", err);

@@ -19,7 +19,7 @@
         </div>
         <div class="glass-card stat-card">
           <h3>Pending Approvals</h3>
-          <div class="stat-value"><%= typeof pendingApprovalsCount === 'number' ? pendingApprovalsCount : 0 %></div>
+          <div class="stat-value" data-pending-approvals-count><%= typeof pendingApprovalsCount === 'number' ? pendingApprovalsCount : 0 %></div>
           <% if (pendingApprovalsLabel) { %>
             <p class="stat-subtext"><%= pendingApprovalsLabel %></p>
           <% } %>
