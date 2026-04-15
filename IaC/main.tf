@@ -198,6 +198,45 @@ resource "google_artifact_registry_repository_iam_member" "service_c_ar_reader" 
 }
 
 # ─────────────────────────────────────────────
+# Service Account — Service D (Orchestrator Agent)
+# Cloud Run — subscribes to risk-detected Pub/Sub topic,
+# runs LangChain + Claude agent, writes to Firestore pending-approvals
+# and approved-actions collections.
+# ─────────────────────────────────────────────
+resource "google_service_account" "service_d" {
+  account_id   = "service-d-orchestrator"
+  display_name = "Service D — Orchestrator Agent"
+  description  = "Runs the LangChain orchestrator agent. Reads shipments from Firestore, writes pending-approvals and approved-actions."
+  project      = var.project_id
+  depends_on   = [google_project_service.apis]
+}
+
+# Read shipment metadata + write pending-approvals + approved-actions
+resource "google_project_iam_member" "service_d_firestore" {
+  project = var.project_id
+  role    = "roles/datastore.user"
+  member  = "serviceAccount:${google_service_account.service_d.email}"
+  depends_on = [google_service_account.service_d]
+}
+
+# Allow Pub/Sub to invoke this Cloud Run service (push subscription auth)
+resource "google_project_iam_member" "service_d_pubsub_invoker" {
+  project = var.project_id
+  role    = "roles/run.invoker"
+  member  = "serviceAccount:${google_service_account.service_d.email}"
+  depends_on = [google_service_account.service_d]
+}
+
+# Pull Docker image from Artifact Registry
+resource "google_artifact_registry_repository_iam_member" "service_d_ar_reader" {
+  repository = google_artifact_registry_repository.agenticterps.name
+  location   = var.region
+  role       = "roles/artifactregistry.reader"
+  member     = "serviceAccount:${google_service_account.service_d.email}"
+  depends_on = [google_service_account.service_d]
+}
+
+# ─────────────────────────────────────────────
 # Service Account — Service E (Execution Agent)
 # Cloud Run — receives approved risk events from execute-actions Pub/Sub topic,
 # sends email/SMS/voice notifications, and writes to BigQuery audit log.
@@ -341,8 +380,11 @@ resource "google_pubsub_subscription" "risk_detected_sub" {
   message_retention_duration = "600s"
 
   push_config {
-    push_endpoint = var.service_d_url != "" ? "${var.service_d_url}/pubsub/risk" : "https://placeholder.invalid/pubsub/risk"
-    attributes    = { x-goog-version = "v1" }
+    push_endpoint = var.service_d_url != "" ? "${var.service_d_url}/risk-detected" : "https://placeholder.invalid/risk-detected"
+    oidc_token {
+      service_account_email = google_service_account.service_d.email
+    }
+    attributes = { x-goog-version = "v1" }
   }
 
   retry_policy {
