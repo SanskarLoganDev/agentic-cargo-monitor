@@ -7,17 +7,22 @@ blocking the others. Results are collected and returned to main.py for
 inclusion in the BigQuery audit log.
 
 Channels:
-  1. Email  — SendGrid REST API (free tier: 100 emails/day)
+  1. Email  — Gmail SMTP via smtplib (stdlib — no extra dependency)
   2. SMS    — Twilio Programmable SMS (trial: pre-verified numbers only)
   3. Voice  — ElevenLabs TTS → GCS (public MP3) → Twilio outbound call
 
-All GCP/external clients are initialised at module level for warm instance reuse.
+Note on client initialisation:
+  Twilio and GCS clients are module-level (reused across warm instances).
+  The Gmail SMTP connection is opened per-send — SMTP connections are stateful
+  and time out during Cloud Run idle periods, so a persistent connection is not safe.
 
 Environment variables required:
   GOOGLE_CLOUD_PROJECT
   VOICE_NOTES_BUCKET       — GCS bucket for temporary MP3 storage
-  SENDGRID_API_KEY
-  SENDGRID_FROM_EMAIL      — verified sender address in SendGrid
+  GMAIL_USER               — full Gmail address used as sender (e.g. you@gmail.com)
+  GMAIL_APP_PASSWORD       — 16-char App Password from Google Account settings
+                             Requires 2FA on the account.
+                             Generate at: https://myaccount.google.com/apppasswords
   TWILIO_ACCOUNT_SID
   TWILIO_AUTH_TOKEN
   TWILIO_PHONE_NUMBER      — your provisioned Twilio number (E.164 format)
@@ -28,14 +33,15 @@ Environment variables required:
 
 import logging
 import os
+import smtplib
 import uuid
 from datetime import datetime, timezone
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
 from typing import Optional
 
 import requests
-import sendgrid
 from google.cloud import storage
-from sendgrid.helpers.mail import Mail
 from twilio.rest import Client as TwilioClient
 from twilio.twiml.voice_response import VoiceResponse
 
@@ -47,8 +53,8 @@ logger = logging.getLogger(__name__)
 PROJECT_ID             = os.environ["GOOGLE_CLOUD_PROJECT"]
 VOICE_NOTES_BUCKET     = os.environ.get("VOICE_NOTES_BUCKET", f"{PROJECT_ID}-voice-notes")
 
-SENDGRID_API_KEY       = os.environ["SENDGRID_API_KEY"]
-SENDGRID_FROM_EMAIL    = os.environ.get("SENDGRID_FROM_EMAIL", "alerts@agenticterps.com")
+GMAIL_USER             = os.environ["GMAIL_USER"]
+GMAIL_APP_PASSWORD     = os.environ["GMAIL_APP_PASSWORD"]
 
 TWILIO_ACCOUNT_SID     = os.environ["TWILIO_ACCOUNT_SID"]
 TWILIO_AUTH_TOKEN      = os.environ["TWILIO_AUTH_TOKEN"]
@@ -60,14 +66,14 @@ ELEVENLABS_TTS_URL     = f"https://api.elevenlabs.io/v1/text-to-speech/{ELEVENLA
 
 # ---------------------------------------------------------------------------
 # Module-level clients — reused across warm Cloud Run instances
+# Note: Gmail SMTP connection is NOT module-level — see send_email() below.
 # ---------------------------------------------------------------------------
 _gcs_client    = storage.Client(project=PROJECT_ID)
-_sg_client     = sendgrid.SendGridAPIClient(api_key=SENDGRID_API_KEY)
 _twilio_client = TwilioClient(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
 
 
 # ---------------------------------------------------------------------------
-# Channel 1 — Email via SendGrid
+# Channel 1 — Email via Gmail SMTP
 # ---------------------------------------------------------------------------
 
 def send_email(
@@ -76,31 +82,53 @@ def send_email(
     body:      str,
 ) -> dict:
     """
-    Send a plain-text email via SendGrid.
+    Send a plain-text email via Gmail SMTP using an App Password.
+
+    Opens a fresh SMTP connection per call — SMTP connections are stateful
+    and time out during Cloud Run idle periods, making a module-level
+    persistent connection unreliable in a serverless environment.
+
+    Prerequisites:
+      - 2-Step Verification must be enabled on the Google account.
+      - Generate a 16-char App Password at:
+        https://myaccount.google.com/apppasswords
+        (App name: AgenticTerps or any label you prefer)
+      - Set GMAIL_USER to the full Gmail address (e.g. you@gmail.com)
+      - Set GMAIL_APP_PASSWORD to the generated 16-char password
 
     Returns:
-        {"success": True, "status_code": 202} on success.
+        {"success": True, "to": str} on success.
         {"success": False, "error": str} on failure.
     """
     if not to_email:
         return {"success": False, "error": "No contact_email in payload"}
 
     try:
-        message = Mail(
-            from_email=SENDGRID_FROM_EMAIL,
-            to_emails=to_email,
-            subject=subject,
-            plain_text_content=body,
+        msg = MIMEMultipart()
+        msg["From"]    = GMAIL_USER
+        msg["To"]      = to_email
+        msg["Subject"] = subject
+        msg.attach(MIMEText(body, "plain"))
+
+        with smtplib.SMTP("smtp.gmail.com", 587) as server:
+            server.starttls()
+            server.login(GMAIL_USER, GMAIL_APP_PASSWORD)
+            server.sendmail(GMAIL_USER, to_email, msg.as_string())
+
+        logger.info("Email sent | from=%s | to=%s", GMAIL_USER, to_email)
+        return {"success": True, "to": to_email}
+
+    except smtplib.SMTPAuthenticationError as exc:
+        logger.error(
+            "Gmail SMTP authentication failed | user=%s | error=%s\n"
+            "Ensure GMAIL_APP_PASSWORD is a valid App Password "
+            "(not your regular Gmail password) and 2FA is enabled.",
+            GMAIL_USER, exc,
         )
-        response = _sg_client.send(message)
-        logger.info(
-            "Email sent | to=%s | status=%d",
-            to_email, response.status_code,
-        )
-        return {"success": True, "status_code": response.status_code}
+        return {"success": False, "error": f"SMTP auth failed: {exc}"}
 
     except Exception as exc:
-        logger.error("SendGrid email failed | to=%s | error=%s", to_email, exc)
+        logger.error("Gmail SMTP email failed | to=%s | error=%s", to_email, exc)
         return {"success": False, "error": str(exc)}
 
 
