@@ -7,6 +7,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import uuid
 from datetime import datetime, timezone
 from typing import Any
@@ -187,7 +188,8 @@ INSTRUCTIONS:
 """
 
     def _parse_agent_output(self, raw_output: Any) -> dict[str, Any]:
-        # Normalise: langchain-anthropic may return a list of content blocks
+        # Normalise: LangChain/Anthropic may return a plain string, a list of
+        # content blocks, or objects with a `.text` attribute.
         if isinstance(raw_output, list):
             parts = []
             for block in raw_output:
@@ -195,27 +197,83 @@ INSTRUCTIONS:
                     parts.append(block["text"])
                 elif isinstance(block, str):
                     parts.append(block)
+                else:
+                    text = getattr(block, "text", None)
+                    if isinstance(text, str):
+                        parts.append(text)
             raw = "\n".join(parts).strip()
         elif isinstance(raw_output, str):
             raw = raw_output.strip()
         else:
-            raise ValueError(f"Unexpected agent output type: {type(raw_output)}")
+            text = getattr(raw_output, "text", None)
+            if isinstance(text, str):
+                raw = text.strip()
+            else:
+                raise ValueError(f"Unexpected agent output type: {type(raw_output)}")
+
+        if not raw:
+            logger.error(
+                "Agent returned empty output | raw_output_type=%s | raw_output_repr=%r",
+                type(raw_output),
+                raw_output,
+            )
+            raise ValueError("Agent returned empty output; no JSON payload was produced.")
 
         # Strip markdown code fences if present
         if raw.startswith("```"):
-            lines = raw.split("\n")
-            start = 1
-            end = len(lines) - 1 if lines[-1].strip() == "```" else len(lines)
-            raw = "\n".join(lines[start:end]).strip()
+            raw = re.sub(r"^```(?:json)?\s*", "", raw, flags=re.IGNORECASE)
+            raw = re.sub(r"\s*```$", "", raw).strip()
 
         try:
             return json.loads(raw)
         except json.JSONDecodeError as exc:
+            extracted = self._extract_json_object(raw)
+            if extracted:
+                try:
+                    return json.loads(extracted)
+                except json.JSONDecodeError:
+                    pass
             logger.error(
                 "Failed to parse agent JSON output: %s\nRaw output (first 500 chars): %s",
                 exc, raw[:500],
             )
             raise ValueError(f"Agent output was not valid JSON: {exc}") from exc
+
+    def _extract_json_object(self, raw: str) -> str | None:
+        """
+        Best-effort extraction of the first complete JSON object from model text.
+        This helps when the model wraps the payload in explanatory prose.
+        """
+        start = raw.find("{")
+        if start == -1:
+            return None
+
+        depth = 0
+        in_string = False
+        escaped = False
+
+        for index in range(start, len(raw)):
+            char = raw[index]
+
+            if in_string:
+                if escaped:
+                    escaped = False
+                elif char == "\\":
+                    escaped = True
+                elif char == '"':
+                    in_string = False
+                continue
+
+            if char == '"':
+                in_string = True
+            elif char == "{":
+                depth += 1
+            elif char == "}":
+                depth -= 1
+                if depth == 0:
+                    return raw[start:index + 1]
+
+        return None
         
     
     def _build_pending_approval(
