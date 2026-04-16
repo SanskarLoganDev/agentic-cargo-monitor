@@ -121,11 +121,10 @@
 
         <div class="glass-card delay-card">
           <h3>flight_delay_status</h3>
-          <select class="flight-status-select" aria-label="Flight delay status">
+          <select class="flight-status-select" data-flight-status aria-label="Flight delay status">
             <option value="on_time" selected>✅ On Time</option>
-            <option value="minor_delay">⚠️ Minor Delay (&lt;1hr)</option>
-            <option value="major_delay">🔴 Major Delay (&gt;1hr)</option>
-            <option value="diverted">🚨 Diverted</option>
+            <option value="delayed_2h">⚠️ Delayed 2 Hours</option>
+            <option value="delayed_6h">🔴 Delayed 6+ Hours / Diverted</option>
           </select>
           <p class="metric-sub">Flight: <%= shipment.flight_icao %></p>
           <p class="metric-sub">Threshold: <%= shipment.max_flight_delay_minutes %> min</p>

@@ -8,6 +8,7 @@ const PROJECT_ID = "project-5b45a270-c7ca-42fd-9f6";
 const FIRESTORE_DATABASE_ID = "cargo-monitor";
 const EXECUTE_ACTIONS_TOPIC = "execute-actions";
 const FRONTEND_APPROVED_BY = "frontend-operator";
+const SERVICE_B_INGEST_URL = "https://us-central1-project-5b45a270-c7ca-42fd-9f6.cloudfunctions.net/ingest-telemetry";
 
 const appCredential = admin.credential.applicationDefault();
 
@@ -102,7 +103,7 @@ function isHandledStatus(status, source) {
     value.includes("approved") ||
     value.includes("handled") ||
     value.includes("resolved") ||
-    value.includes("complete") ||
+    value.includes("completed") ||
     value.includes("closed") ||
     value.includes("success") ||
     value.includes("done") ||
@@ -348,6 +349,97 @@ async function publishExecuteActionMessage(payload) {
   return response.json();
 }
 
+function toNumberOrFallback(value, fallback) {
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? parsed : fallback;
+}
+
+function toIntegerOrFallback(value, fallback) {
+  const parsed = Number.parseInt(value, 10);
+  return Number.isFinite(parsed) ? parsed : fallback;
+}
+
+function normalizeFlightDelayStatus(value) {
+  const normalized = (value || "").toString().trim().toLowerCase();
+
+  if (normalized === "delayed_2h" || normalized === "delayed_6h" || normalized === "on_time") {
+    return normalized;
+  }
+
+  if (normalized === "minor_delay") return "delayed_2h";
+  if (normalized === "major_delay" || normalized === "diverted") return "delayed_6h";
+
+  return "on_time";
+}
+
+async function forwardTelemetryToServiceB(medicineKey, updates) {
+  const shipment = await getShipmentById(medicineKey);
+  if (!shipment) {
+    return {
+      ok: false,
+      status: 404,
+      body: { status: "not_found", message: "Shipment not found." }
+    };
+  }
+
+  const liveTelemetry = shipment.live_telemetry || {};
+  const telemetryPayload = {
+    drug_id: shipment.drug_id || medicineKey,
+    temperature_celsius: toNumberOrFallback(
+      updates.temperature_celsius,
+      toNumberOrFallback(
+        liveTelemetry.temperature_celsius,
+        (toNumberOrFallback(shipment.temp_min_celsius, 0) + toNumberOrFallback(shipment.temp_max_celsius, 0)) / 2
+      )
+    ),
+    humidity_percent: toNumberOrFallback(
+      updates.humidity_percent,
+      toNumberOrFallback(
+        liveTelemetry.humidity_percent,
+        Math.round(toNumberOrFallback(shipment.max_humidity_percent, 0) * 0.6)
+      )
+    ),
+    shock_g: toNumberOrFallback(
+      updates.shock_g,
+      toNumberOrFallback(
+        liveTelemetry.shock_g,
+        Number((toNumberOrFallback(shipment.max_shock_g, 0) * 0.2).toFixed(2))
+      )
+    ),
+    flight_delay_status: normalizeFlightDelayStatus(
+      updates.flight_delay_status || liveTelemetry.flight_delay_status || "on_time"
+    ),
+    timestamp: new Date().toISOString(),
+    excursion_minutes: toIntegerOrFallback(
+      updates.excursion_minutes,
+      toIntegerOrFallback(
+        liveTelemetry.excursion_minutes,
+        0
+      )
+    )
+  };
+
+  const response = await fetch(SERVICE_B_INGEST_URL, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(telemetryPayload)
+  });
+
+  let body = null;
+  try {
+    body = await response.json();
+  } catch {
+    body = null;
+  }
+
+  return {
+    ok: response.ok,
+    status: response.status,
+    body,
+    telemetryPayload
+  };
+}
+
 // TEMP TEST ROUTE - delete after confirming Firestore works
 app.get("/test-firestore", async (req, res) => {
   try {
@@ -534,11 +626,28 @@ app.post("/api/shipment/:medicineKey/save-updates", async (req, res) => {
       return res.status(400).json({ status: "no_changes", message: "No updates to save." });
     }
 
+    const result = await forwardTelemetryToServiceB(medicineKey, updates);
+
+    if (!result.ok) {
+      console.error("Service B ingest failed:", {
+        medicineKey,
+        status: result.status,
+        body: result.body,
+        telemetryPayload: result.telemetryPayload
+      });
+      return res.status(502).json({
+        status: "error",
+        message: "Failed to send telemetry to Service B.",
+        service_b_status: result.status,
+        service_b_response: result.body
+      });
+    }
+
     return res.json({
-      status: "queued",
+      status: "published",
       medicineKey,
-      updates,
-      message: "Updates captured - placeholder for Service B handoff."
+      telemetry: result.telemetryPayload,
+      serviceB: result.body
     });
   } catch (err) {
     console.error("Save updates error:", err);
